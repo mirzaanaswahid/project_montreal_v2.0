@@ -332,7 +332,13 @@ class EAGLESimulation:
         
         # Communication stats
         comm_stats = self.comm_network.get_network_stats()
-        self.metrics["messages_sent"] = comm_stats["total_messages_sent"]
+        self.metrics["messages_sent"] = comm_stats.get("delivered", 0)
+        
+        # align with FEnergy: report energy saved from thermals
+        self.metrics["total_energy_saved"] = float(sum(a.egain_J for a in self.agents))
+        
+        # (Optional) also expose motor energy used:
+        # self.metrics["total_motor_energy_J"] = float(sum(a.cmotor_J for a in self.agents))
     
     def _update_visualization(self):
         """Update real-time visualization"""
