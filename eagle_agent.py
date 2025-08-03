@@ -143,6 +143,11 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         self.alt_band = (self.cfg.altitude_ref - self.cfg.alt_band_m,
                          self.cfg.altitude_ref + self.cfg.alt_band_m)
         
+        # Energy tracking
+        self.cmotor_J = 0.0           # Σ u_k * P_elec,k * Δt
+        self.egain_J  = 0.0           # Σ B_i(t) for exploited thermals
+        self._thermal_gain_booked = False
+        
         # Logging
         self.eagle_logger = self._setup_eagle_logger()
     
@@ -263,6 +268,11 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         # Update energy
         self._update_power()
         self.energy_wh = max(self.energy_wh - self.P_elec * dt / 3600.0, 0.0)
+        
+        # Motor-use accumulator per FEnergy (count motor only when not soaring)
+        motor_on = (self.soaring_state not in ("thermal_exploitation", "gliding"))
+        if motor_on:
+            self.cmotor_J += float(self.P_elec) * dt  # J = W * s
     
     def _update_power(self):
         """Calculate power consumption"""
@@ -366,6 +376,7 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         if elapsed > self.cfg.max_thermal_dwell_s:
             self.soaring_state = "normal"
             self.current_thermal = None
+            self._thermal_gain_booked = False
             return
         
         # Spiral pattern
@@ -397,6 +408,12 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         self.soaring_state = "thermal_exploitation"
         self.exploitation_start_time = t
         self.eagle_logger.info(f"{self.uav_id} starting thermal exploitation")
+        
+        # Book the benefit once at start, per B_i(t) definition (Eq. 14)
+        if not self._thermal_gain_booked:
+            b = max(0.0, float(self.calculate_thermal_benefit(thermal)))
+            self.egain_J += b
+            self._thermal_gain_booked = True
     
     def get_tier(self) -> AgentTier:
         """Determine current agent tier based on battery and state"""

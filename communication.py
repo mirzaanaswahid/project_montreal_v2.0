@@ -103,6 +103,13 @@ class CommunicationNetwork:
         self.message_history: List[Message] = []
         self.message_counter = 0
         
+        # Statistics tracking
+        self.stats = {
+            "posted": 0,         # enqueued
+            "delivered": 0,      # actually delivered to recipients
+            "expired": 0         # dropped due to TTL
+        }
+        
         # Simulation clock
         self.sim_time: float = 0.0
         
@@ -138,6 +145,9 @@ class CommunicationNetwork:
         
         # Add to outbox for processing
         self.outbox[msg.sender_id].append(msg)
+        
+        # Increment posted counter
+        self.stats["posted"] += 1
         
         self._log(f"Message queued: {msg.msg_type.value} from {msg.sender_id}")
     
@@ -181,6 +191,7 @@ class CommunicationNetwork:
                 # Check TTL
                 if current_time - msg.timestamp > msg.ttl:
                     self._log(f"Message expired: {msg.msg_id}")
+                    self.stats["expired"] += 1
                     continue
                 
                 # Determine recipients
@@ -232,6 +243,7 @@ class CommunicationNetwork:
             
             if delivery_time <= current_time:
                 delivered.append(msg)
+                self.stats["delivered"] += 1
                 self._log(f"Delivered: {msg.msg_type.value} to {agent_id}")
             else:
                 # Not ready yet, keep in queue
@@ -254,12 +266,16 @@ class CommunicationNetwork:
         for msg in self.message_history:
             msg_type_counts[msg.msg_type.value] += 1
         
-        return {
+        # Combine new stats with existing ones
+        stats = dict(self.stats)
+        stats.update({
             "total_messages_sent": total_sent,
             "messages_pending_delivery": total_delivered,
             "message_types": dict(msg_type_counts),
             "agents_connected": len(self.agent_positions)
-        }
+        })
+        
+        return stats
     
     def save_message_log(self, filename: str = "eagle_comms.json"):
         """Save message history to file"""
