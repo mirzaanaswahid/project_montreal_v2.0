@@ -1,0 +1,1169 @@
+#!/usr/bin/env python3
+"""
+eagle_agent.py - EAGLE-enabled UAV agent
+Extends base UAVAgent with EAGLE decision-making capabilities
+"""
+
+import time
+import math
+import numpy as np
+from typing import Dict, List, Optional, Tuple, Set
+from dataclasses import dataclass
+from enum import Enum
+
+
+from config import PhoenixConfig
+from communication import CommunicationNetwork, MessageType, Message
+from thermals import Thermal
+from events import GroundEvent
+
+
+class AgentTier(Enum):
+    """Agent health tiers for auction priority"""
+    HEALTHY_NOMAD = "HEALTHY_NOMAD"      # >50% battery, not soaring
+    HEALTHY_SOARING = "HEALTHY_SOARING"  # >50% battery, currently soaring  
+    LOW_BATTERY = "LOW_BATTERY"          # <50% battery
+
+
+class ThermalPolicy(Enum):
+    STRICT_ALT = 0   # no net Δh; motor-off savings only
+    ALT_BAND   = 1   # allow Δh within [hmin, hmax]
+
+
+@dataclass
+class EventAuction:
+    """Tracks an ongoing event investigation auction"""
+    event_id: str
+    event: GroundEvent
+    initiator_id: str
+    start_time: float
+    tier_bids: Dict[str, List[Tuple[str, float]]]  # tier -> [(agent_id, cost)]
+    current_tier: int = 0
+    resolved: bool = False
+    winner_id: Optional[str] = None
+
+
+@dataclass
+class ThermalAuction:
+    """Tracks a thermal exploitation auction"""
+    thermal_id: str
+    thermal: Thermal
+    initiator_id: str
+    start_time: float
+    bids: List[Tuple[str, float]]  # [(agent_id, benefit_score)]
+    resolved: bool = False
+    winner_id: Optional[str] = None
+
+
+class EAGLEAgent:  # Remove inheritance from UAVAgent
+    """
+    Standalone EAGLE UAV agent with all necessary flight capabilities
+    """
+    
+    def __init__(self, 
+                 cfg: PhoenixConfig,
+                 uav_id: str,
+                 comm_network: CommunicationNetwork,
+                 home_region: Optional[str] = None):
+        
+        # Basic identification
+        self.cfg = cfg
+        self.uav_id = uav_id
+        
+        # Core flight state (what was in UAVAgent)
+        self.pos = np.zeros(3)  # [x, y, z] position
+        self.V_h = 0.0  # Horizontal speed
+        self.vz = 0.0   # Vertical speed
+        self.psi = 0.0  # Heading (radians)
+        self.t = 0.0    # Simulation time
+        self.energy_wh = cfg.batt_capacity_wh  # Battery energy
+        self.throttle = 0.0
+        self.P_elec = cfg.p_avionics
+        
+        # Flight modes
+        self.flight_mode = "ground"  # ground, armed, takeoff, mission, landing
+        self.soaring_state = "normal"  # normal, thermal_exploitation, gliding
+        self.event_mode = "idle"  # idle, investigating
+        
+        # Waypoint navigation
+        self.waypoints = []
+        self.current_wp_index = -1
+        self.target_alt = 0.0
+        self.target_speed = 0.0
+        self.target_heading = 0.0
+        
+        # Event detection
+        self.detected_event_ids = set()
+        self.investigated_event_ids = set()
+        self.detected_thermal_ids = set()
+        self.exploited_thermal_ids = set()
+        
+        # Current environment
+        self.current_thermals = []
+        self.current_events = []
+        
+        # Event investigation state
+        self.event_center = None
+        self.event_radius = 50.0  # Default loiter radius
+        
+        # Thermal exploitation
+        self.current_thermal = None
+        self.exploitation_start_time = 0.0
+        
+        # Navigation
+        self.planned_route = []
+        self.heading = self.psi
+        self.dt = 1.0
+        
+        # Communication
+        self.comm = comm_network
+        self.comm.register_agent(uav_id, self.pos)
+        
+        # EAGLE-specific state
+        self.home_region = home_region
+        self.peer_states = {}
+        
+        # Auction tracking
+        self.active_event_auctions = {}
+        self.active_thermal_auctions = {}
+        self.my_event_bids = set()
+        self.my_thermal_bids = set()
+        
+        # Task assignments
+        self.assigned_event = None
+        self.assigned_thermal = None
+        
+        # EAGLE parameters
+        self.tier_timeout = getattr(cfg, 'eagle_tier_timeout_s', 5.0)
+        self.auction_timeout = getattr(cfg, 'eagle_auction_timeout_s', 20.0)
+        self.benefit_threshold = getattr(cfg, 'eagle_benefit_threshold_j', 500.0)
+        
+        # Thermal policy
+        self.thermal_policy = ThermalPolicy.STRICT_ALT
+        self.alt_band = (self.cfg.altitude_ref - self.cfg.alt_band_m,
+                         self.cfg.altitude_ref + self.cfg.alt_band_m)
+        
+        # Logging
+        self.eagle_logger = self._setup_eagle_logger()
+    
+    @property
+    def vel(self) -> np.ndarray:
+        """Velocity vector [vx, vy, vz]"""
+        return np.array([
+            self.V_h * np.sin(self.psi),
+            self.V_h * np.cos(self.psi),
+            self.vz
+        ])
+
+    @property
+    def wind_xy(self) -> np.ndarray:
+        """Horizontal wind vector"""
+        return self.cfg.wind_enu[:2] if hasattr(self.cfg, 'wind_enu') else np.zeros(2)
+
+    @property
+    def tnow(self) -> float:
+        """Current simulation time"""
+        return self.t
+
+    def ground_speed(self, airspeed: float) -> float:
+        """Ground speed given airspeed and wind"""
+        # Simplified - assumes flying into/with wind
+        return max(1.0, airspeed - np.linalg.norm(self.wind_xy))
+    
+    def _setup_eagle_logger(self):
+        """Setup EAGLE-specific logging"""
+        import logging
+        logger = logging.getLogger(f"{self.uav_id}_EAGLE")
+        logger.setLevel(logging.INFO)
+        return logger
+    
+    # Add missing basic flight methods
+    def arm(self):
+        """Arm the UAV"""
+        if self.flight_mode == "ground":
+            self.flight_mode = "armed"
+            self.eagle_logger.info(f"{self.uav_id} armed")
+    
+    def takeoff(self, target_alt_m: float = None):
+        """Initiate takeoff"""
+        if target_alt_m is None:
+            target_alt_m = self.cfg.cruise_alt_m
+        
+        self.target_alt = target_alt_m
+        self.target_speed = self.cfg.cruise_speed
+        self.flight_mode = "takeoff"
+        self.eagle_logger.info(f"{self.uav_id} taking off to {target_alt_m}m")
+    
+    def land(self):
+        """Initiate landing"""
+        if self.flight_mode != "ground":
+            self.flight_mode = "landing"
+            self.target_alt = 0.0
+            self.target_speed = self.cfg.landing_speed
+            self.eagle_logger.info(f"{self.uav_id} landing initiated")
+    
+    def set_waypoints(self, wps):
+        """Set waypoints for navigation"""
+        self.waypoints = [np.asarray(wp, dtype=float) for wp in wps]
+        self.current_wp_index = 0 if wps else -1
+        self.eagle_logger.info(f"{self.uav_id} received {len(self.waypoints)} waypoints")
+    
+    def battery_pct(self) -> float:
+        """Get battery percentage"""
+        return 100 * self.energy_wh / self.cfg.batt_capacity_wh
+    
+    def set_target_heading(self, psi_rad: float):
+        """Set target heading in radians"""
+        self.target_heading = psi_rad
+        self.psi = psi_rad
+
+    def set_target_speed(self, speed: float):
+        """Set target speed in m/s"""
+        self.target_speed = speed
+        self.V_h = speed
+    
+    def update(self, dt: float, t: float, thermals: List[Thermal], events: List[GroundEvent]):
+        """Main update method - single public entry point for agent updates"""
+        # Store environment
+        self.current_thermals = thermals or []
+        self.current_events = events or []
+        
+        # Update simulation time
+        self.t = t
+        
+        # Run EAGLE decision-making step
+        self._eagle_step(dt, t, thermals, events)
+        
+        # Update physics and guidance
+        self._update_physics(dt)
+        self._update_flight_mode()
+    
+    def _update_physics(self, dt: float):
+        """Update position and energy"""
+        # Update position based on velocity
+        v_air = np.array([
+            self.V_h * math.sin(self.psi),
+            self.V_h * math.cos(self.psi),
+            self.vz
+        ])
+        
+        # Add wind if available
+        v_enu = v_air + self.cfg.wind_enu
+        
+        # Update position
+        self.pos += v_enu * dt
+        
+        # Keep above ground
+        if self.pos[2] < 0:
+            self.pos[2] = 0
+            self.vz = 0
+            if self.flight_mode != "ground":
+                self.flight_mode = "ground"
+        
+        # Update energy
+        self._update_power()
+        self.energy_wh = max(self.energy_wh - self.P_elec * dt / 3600.0, 0.0)
+    
+    def _update_power(self):
+        """Calculate power consumption"""
+        if self.soaring_state in ("thermal_exploitation", "gliding"):
+            self.P_elec = 0.0
+            return
+        
+        if self.V_h < 0.1:
+            self.throttle = 0.0
+            self.P_elec = self.cfg.p_avionics
+            return
+        
+        # Simplified power model
+        self.P_elec = self.cfg.max_motor_power_w * self.throttle + self.cfg.p_avionics
+    
+    def _update_flight_mode(self):
+        """Update flight mode state machine"""
+        if self.flight_mode == "takeoff":
+            self.vz = self.cfg.climb_rate
+            if self.pos[2] >= 0.95 * self.target_alt:
+                self.flight_mode = "mission"
+                self.eagle_logger.info(f"{self.uav_id} reached mission altitude")
+        
+        elif self.flight_mode == "mission":
+            # Navigate waypoints or investigate events
+            if self.event_mode == "investigating":
+                self._handle_event_investigation()
+            elif self.soaring_state == "thermal_exploitation":
+                self._handle_thermal_exploitation()
+            else:
+                self._update_waypoint_navigation()
+        
+        elif self.flight_mode == "landing":
+            self.vz = self.cfg.landing_descent_rate
+            if self.pos[2] <= 0.05:
+                self.flight_mode = "ground"
+                self.V_h = 0.0
+                self.vz = 0.0
+                self.eagle_logger.info(f"{self.uav_id} landed")
+    
+    def _update_waypoint_navigation(self):
+        """Basic waypoint navigation"""
+        if not self.waypoints or self.current_wp_index < 0:
+            return
+        
+        if self.current_wp_index >= len(self.waypoints):
+            self.land()
+            return
+        
+        # Navigate to current waypoint
+        wp = self.waypoints[self.current_wp_index]
+        vec = wp[:2] - self.pos[:2]
+        dist = np.linalg.norm(vec)
+        
+        if dist < self.cfg.waypoint_tol:
+            self.current_wp_index += 1
+            self.eagle_logger.info(f"{self.uav_id} reached waypoint {self.current_wp_index}")
+        else:
+            # Set heading toward waypoint
+            self.target_heading = math.atan2(vec[0], vec[1])
+            self.target_alt = wp[2]
+            self.target_speed = self.cfg.cruise_speed
+            
+            # Simple control
+            self.psi = self.target_heading
+            self.V_h = self.target_speed
+            self.vz = np.clip(self.target_alt - self.pos[2], 
+                            self.cfg.descent_rate, self.cfg.climb_rate)
+    
+    def _handle_event_investigation(self):
+        """Handle event investigation loitering"""
+        if self.event_center is None:
+            self.event_mode = "idle"
+            return
+        
+        # Simple circular loiter around event
+        vec = self.event_center - self.pos[:2]
+        dist = np.linalg.norm(vec)
+        
+        # Maintain loiter radius
+        if dist > self.event_radius:
+            self.target_heading = math.atan2(vec[0], vec[1])
+        else:
+            # Circle around
+            tangent = np.array([-vec[1], vec[0]])
+            tangent = tangent / np.linalg.norm(tangent)
+            self.target_heading = math.atan2(tangent[0], tangent[1])
+        
+        self.psi = self.target_heading
+        self.V_h = self.cfg.V_loiter
+        self.vz = 0.0
+    
+    def _handle_thermal_exploitation(self):
+        """Handle thermal soaring"""
+        if self.current_thermal is None:
+            self.soaring_state = "normal"
+            return
+        
+        # Simple spiral in thermal
+        elapsed = self.t - self.exploitation_start_time
+        if elapsed > self.cfg.max_thermal_dwell_s:
+            self.soaring_state = "normal"
+            self.current_thermal = None
+            return
+        
+        # Spiral pattern
+        angle = elapsed * 0.1  # radians per second
+        radius = 0.8 * self.current_thermal.radius
+        
+        target = np.array([
+            self.current_thermal.center[0] + radius * math.cos(angle),
+            self.current_thermal.center[1] + radius * math.sin(angle)
+        ])
+        
+        vec = target - self.pos[:2]
+        if np.linalg.norm(vec) > 1.0:
+            self.target_heading = math.atan2(vec[0], vec[1])
+            self.psi = self.target_heading
+        
+        self.V_h = self.cfg.min_speed
+        self.throttle = 0.0  # Motor off
+    
+    def _start_event_investigation(self, cx: float, cy: float):
+        """Start investigating an event"""
+        self.event_mode = "investigating"
+        self.event_center = np.array([cx, cy])
+        self.eagle_logger.info(f"{self.uav_id} starting event investigation at ({cx}, {cy})")
+    
+    def _initiate_thermal_exploitation(self, thermal: Thermal, t: float):
+        """Start exploiting a thermal"""
+        self.current_thermal = thermal
+        self.soaring_state = "thermal_exploitation"
+        self.exploitation_start_time = t
+        self.eagle_logger.info(f"{self.uav_id} starting thermal exploitation")
+    
+    def get_tier(self) -> AgentTier:
+        """Determine current agent tier based on battery and state"""
+        battery_pct = self.battery_pct()
+        
+        if battery_pct < 50.0:
+            return AgentTier.LOW_BATTERY
+        elif self.soaring_state == "thermal_exploitation":
+            return AgentTier.HEALTHY_SOARING
+        else:
+            return AgentTier.HEALTHY_NOMAD
+    
+    def _specific_energy_per_meter(self, V_air: float, wind_xy: np.ndarray) -> float:
+        """
+        J/m along-ground at given airspeed. Uses drag polar and prop efficiency.
+        Assumes coordinated level flight (phi=0). For turns, scale induced term by n^2.
+        """
+        rho = self.cfg.air_density
+        S   = self.cfg.wing_area
+        CD0 = self.cfg.CD0
+        k   = self.cfg.induced_drag_k
+        W   = self.cfg.mass * 9.81
+        eta = self.cfg.prop_eta
+
+        q = 0.5 * rho * V_air**2
+        D_par = q * S * CD0
+        D_ind = k * W**2 / (q * S)  # level flight
+        P = (D_par + D_ind) * V_air / max(eta, 1e-3)
+        V_gnd = max(1.0, V_air + np.dot(wind_xy, (self.vel[:2] / (np.linalg.norm(self.vel[:2])+1e-6))))
+        return P / V_gnd
+
+    def calculate_investigation_cost(self, event: GroundEvent) -> float:
+        """
+        J: transit to event + one stabilized orbit at (V_loiter, phi_loiter)
+        """
+        p0 = self.pos.copy()
+        pe = np.array([event.cx, event.cy, p0[2]])
+        d_xy = np.linalg.norm(p0[:2] - pe[:2])
+
+        V_cruise = self.cfg.V_range_opt
+        spec_e = self._specific_energy_per_meter(V_cruise, self.wind_xy)
+        E_transit = spec_e * d_xy
+
+        phi = self.cfg.loiter_bank_deg * np.pi/180.0
+        n = 1.0 / max(np.cos(phi), 0.2)
+        V_loiter = self.cfg.V_loiter
+        # turn power with n^2 scaling on induced
+        rho, S, CD0, k, W, eta = (self.cfg.air_density, self.cfg.wing_area, 
+                                  self.cfg.CD0, self.cfg.induced_drag_k, 
+                                  self.cfg.mass*9.81, self.cfg.prop_eta)
+        q = 0.5 * rho * V_loiter**2
+        D_par = q * S * CD0
+        D_ind = n**2 * k * W**2 / (q * S)
+        P_turn = (D_par + D_ind) * V_loiter / max(eta, 1e-3)
+
+        R = V_loiter**2 / (9.81 * np.tan(phi))
+        T_orbit = (2*np.pi*R) / max(self.ground_speed(V_loiter), 1.0)
+        E_loiter = P_turn * T_orbit
+
+        return E_transit + E_loiter
+    
+    def calculate_thermal_benefit(self, thermal: Thermal) -> float:
+        p = self.pos.copy()
+        r_xy = np.linalg.norm(p[:2] - np.array(thermal.center[:2]))
+        # time to enter disk, assume straight-line at V_cruise
+        t_entry = r_xy / max(self.ground_speed(self.cfg.V_range_opt), 1.0)
+
+        # estimate average climb within usable core
+        w_bar = self._expected_wair(thermal, p[:2])  # m/s vertical airmass
+        if w_bar <= 0.2:  # below threshold
+            return -np.inf
+
+        dwell = min(self.cfg.max_thermal_dwell_s, thermal.time_remaining(self.tnow) - t_entry)
+        if dwell <= 0:
+            return -np.inf
+
+        if self.thermal_policy is ThermalPolicy.STRICT_ALT:
+            # motor-off savings while dwelling (assume throttle=0 except trim)
+            P_base = self._loiter_power_in_still_air()  # same phi/V as above
+            E_saved = P_base * dwell * self.cfg.motor_cut_fraction
+            E_gain  = E_saved
+        else:
+            # climb within band
+            hmax = min(self.alt_band[1], thermal.top_height)
+            dh   = max(0.0, hmax - p[2])
+            t_climb = min(dwell, dh / w_bar)
+            E_saved = self._loiter_power_in_still_air() * t_climb * self.cfg.motor_cut_fraction
+            E_gain  = self.cfg.mass * 9.81 * (w_bar * t_climb)  # potential energy gained
+
+        # detour is incremental path-length vs planned next waypoint
+        d_detour = self._incremental_detour_length(thermal.center[:2])
+        E_detour = self._specific_energy_per_meter(self.cfg.V_range_opt, self.wind_xy) * d_detour
+
+        C = self._thermal_confidence(thermal)  # [0,1] from tracker/variometer SNR
+        return C * (E_gain + E_saved) - E_detour
+    
+    def _expected_wair(self, thermal: Thermal, pos_xy: np.ndarray) -> float:
+        """
+        Estimate average vertical airspeed within thermal core
+        """
+        # Distance from thermal center
+        r = np.linalg.norm(pos_xy - thermal.center[:2])
+        
+        # Simple model: linear decay from center strength
+        if r <= thermal.radius:
+            # Within core - use full strength
+            return thermal.strength
+        else:
+            # Outside core - decay with distance
+            return max(0.0, thermal.strength * (thermal.radius / r))
+    
+    def _loiter_power_in_still_air(self) -> float:
+        """
+        Power required for loiter in still air at current bank angle
+        """
+        phi = self.cfg.loiter_bank_deg * np.pi/180.0
+        n = 1.0 / max(np.cos(phi), 0.2)
+        V_loiter = self.cfg.V_loiter
+        
+        # Calculate power with n^2 scaling on induced drag
+        rho, S, CD0, k, W, eta = (self.cfg.air_density, self.cfg.wing_area, 
+                                  self.cfg.CD0, self.cfg.induced_drag_k, 
+                                  self.cfg.mass*9.81, self.cfg.prop_eta)
+        q = 0.5 * rho * V_loiter**2
+        D_par = q * S * CD0
+        D_ind = n**2 * k * W**2 / (q * S)
+        P_turn = (D_par + D_ind) * V_loiter / max(eta, 1e-3)
+        
+        return P_turn
+    
+    def _incremental_detour_length(self, thermal_pos_xy: np.ndarray) -> float:
+        """
+        Calculate incremental path length to thermal vs planned route
+        """
+        # If no planned route, use direct distance
+        if not hasattr(self, 'planned_route') or not self.planned_route:
+            return np.linalg.norm(self.pos[:2] - thermal_pos_xy)
+        
+        # Find closest point on planned route
+        min_dist = float('inf')
+        closest_point = None
+        
+        for i, waypoint in enumerate(self.planned_route):
+            dist = np.linalg.norm(waypoint[:2] - thermal_pos_xy)
+            if dist < min_dist:
+                min_dist = dist
+                closest_point = waypoint
+        
+        if closest_point is None:
+            return np.linalg.norm(self.pos[:2] - thermal_pos_xy)
+        
+        # Calculate detour: current_pos -> thermal -> closest_waypoint
+        d1 = np.linalg.norm(self.pos[:2] - thermal_pos_xy)
+        d2 = np.linalg.norm(thermal_pos_xy - closest_point[:2])
+        
+        return d1 + d2
+    
+    def _thermal_key(self, center, top_height, radius) -> str:
+        x, y = np.round(center[0], 1), np.round(center[1], 1)
+        th, r = round(top_height, 0), round(radius, 1)
+        return f"th_{x}_{y}_{th}_{r}"
+
+    def _thermal_confidence(self, thermal: Thermal) -> float:
+        # Example: clamp from tracker variance or variometer SNR
+        return np.clip(thermal.confidence if hasattr(thermal, "confidence") else 0.6, 0.0, 1.0)
+    
+    def _eagle_step(self, dt: float, t: float, thermals: List[Thermal], events: List[GroundEvent]):
+        """
+        Main EAGLE decision-making step implementing Algorithm 1
+        """
+        # Update position in network
+        self.comm.update_agent_position(self.uav_id, self.pos)
+        
+        # Process incoming messages
+        messages = self.comm.get_messages(self.uav_id, t)
+        self._process_messages(messages, t)
+        
+        # EAGLE Main Loop (Algorithm 1)
+        
+        # Check 0: Absolute safety
+        if self.battery_pct() < 10.0:  # CRITICAL_THRESHOLD
+            if self.flight_mode != "landing":
+                self.eagle_logger.warning(f"CRITICAL battery - initiating emergency landing")
+                self.land()
+            
+        # Check 1: High-priority event investigation
+        elif self._check_for_high_priority_events(events, t):
+            pass  # Handled in method
+            
+        # Check 2: Handle handover requests
+        elif self._handle_handover_requests(t):
+            pass  # Handled in method
+            
+        # Check 3: Energy management (thermal soaring)
+        elif self.battery_pct() < 50.0:  # LOW_THRESHOLD
+            self._handle_proactive_soaring(thermals, t)
+            
+        # Check 4: Default behaviors
+        else:
+            self._announce_discoveries(thermals, events, t)
+        
+        # Process ongoing auctions
+        self._update_auctions(t)
+    
+    def _process_messages(self, messages: List[Message], current_time: float):
+        """Process all incoming messages"""
+        for msg in messages:
+            self.eagle_logger.info(f"Received {msg.msg_type.value} from {msg.sender_id}")
+            
+            if msg.msg_type == MessageType.HANDOVER_REQUEST:
+                self._handle_handover_request_msg(msg, current_time)
+                
+            elif msg.msg_type == MessageType.EVENT_BID:
+                self._handle_event_bid_msg(msg)
+                
+            elif msg.msg_type == MessageType.TASK_CLAIMED:
+                self._handle_task_claimed_msg(msg)
+                
+            elif msg.msg_type == MessageType.THERMAL_DISCOVERED:
+                self._handle_thermal_discovered_msg(msg)
+                
+            elif msg.msg_type == MessageType.LIVE_THERMAL_BID:
+                self._handle_thermal_bid_msg(msg)
+                
+            elif msg.msg_type == MessageType.THERMAL_CLAIMED:
+                self._handle_thermal_claimed_msg(msg)
+                
+            elif msg.msg_type == MessageType.AGENT_STATE:
+                self._update_peer_state(msg)
+    
+    def _check_for_high_priority_events(self, events: List[GroundEvent], t: float) -> bool:
+        """
+        Check for high-priority events and initiate investigation
+        Returns True if handling an event
+        """
+        # Skip if already investigating
+        if self.event_mode == "investigating":
+            return True
+            
+        # Look for new high-priority events
+        for event in events:
+            if event.level != "High" or not event.active(t):
+                continue
+                
+            # Check if already detected
+            if event.id in self.detected_event_ids:
+                continue
+                
+            # Check detection range
+            dist = np.linalg.norm(self.pos[:2] - np.array([event.cx, event.cy]))
+            if dist > 1000.0:  # Max detection range
+                continue
+            
+            self.eagle_logger.info(f"Detected high-priority event {event.id}")
+            self.detected_event_ids.add(event.id)
+            
+            # Calculate investigation cost
+            cost = self.calculate_investigation_cost(event)
+            
+            # Check feasibility
+            energy_available = self.energy_wh * 3600  # Convert to Joules
+            if energy_available - cost > 0.2 * self.cfg.batt_capacity_wh * 3600:  # Keep 20% reserve
+                # Can handle it ourselves
+                self.eagle_logger.info(f"Claiming event {event.id} (cost={cost:.0f}J)")
+                self._claim_and_investigate(event)
+                return True
+            else:
+                # Need help - broadcast handover request
+                self.eagle_logger.info(f"Broadcasting handover request for event {event.id}")
+                self._broadcast_handover_request(event, t)
+                return True
+        
+        return False
+    
+    def _broadcast_handover_request(self, event: GroundEvent, t: float):
+        """Broadcast event handover request (Algorithm 2)"""
+        # Create auction
+        auction = EventAuction(
+            event_id=event.id,
+            event=event,
+            initiator_id=self.uav_id,
+            start_time=t,
+            tier_bids={tier.value: [] for tier in AgentTier}
+        )
+        self.active_event_auctions[event.id] = auction
+        
+        # Broadcast request
+        self.comm.broadcast(
+            self.uav_id,
+            MessageType.HANDOVER_REQUEST,
+            {
+                "event_id": event.id,
+                "event_level": event.level,
+                "position": [event.cx, event.cy],
+                "detection_time": t
+            }
+        )
+    
+    def _handle_handover_requests(self, t: float) -> bool:
+        """
+        Handle received handover requests (Algorithm 3)
+        Returns True if participating in an auction
+        """
+        # Check if we're eligible to help (healthy state)
+        if self.battery_pct() < 30.0 or self.event_mode == "investigating":
+            return False
+        
+        # Find earliest pending auction we haven't bid on
+        earliest_auction = None
+        earliest_time = float('inf')
+        
+        for auction in self.active_event_auctions.values():
+            if (auction.event_id not in self.my_event_bids and 
+                auction.initiator_id != self.uav_id and
+                auction.start_time < earliest_time):
+                earliest_auction = auction
+                earliest_time = auction.start_time
+        
+        if earliest_auction:
+            self._attempt_event_bid(earliest_auction, t)
+            return True
+        
+        return False
+    
+    def _attempt_event_bid(self, auction: EventAuction, t: float):
+        """Submit bid for event investigation (Algorithm 4)"""
+        # Check if within bidding pool (2km radius)
+        dist = np.linalg.norm(
+            self.pos[:2] - np.array([auction.event.cx, auction.event.cy])
+        )
+        if dist > 2000.0:
+            return
+        
+        # Calculate our cost
+        cost = self.calculate_investigation_cost(auction.event)
+        
+        # Check feasibility with reserve
+        energy_available = self.energy_wh * 3600
+        if energy_available - cost < 0.2 * self.cfg.batt_capacity_wh * 3600:
+            return
+        
+        # Submit bid based on our tier
+        tier = self.get_tier()
+        
+        self.comm.broadcast(
+            self.uav_id,
+            MessageType.EVENT_BID,
+            {
+                "event_id": auction.event_id,
+                "bid_cost": cost,
+                "tier": tier.value,
+                "agent_id": self.uav_id
+            }
+        )
+        
+        self.my_event_bids.add(auction.event_id)
+        self.eagle_logger.info(f"Submitted bid for event {auction.event_id}: cost={cost:.0f}J, tier={tier.value}")
+    
+    def _handle_proactive_soaring(self, thermals: List[Thermal], t: float):
+        """
+        Seek thermals when battery is low (Algorithm 7)
+        """
+        # Check live thermal broadcasts first
+        best_thermal = None
+        best_benefit = -float('inf')
+        
+        for thermal_id, auction in self.active_thermal_auctions.items():
+            if thermal_id in self.my_thermal_bids:
+                continue
+                
+            benefit = self.calculate_thermal_benefit(auction.thermal)
+            if benefit > best_benefit and benefit > self.benefit_threshold:
+                best_thermal = auction.thermal
+                best_benefit = benefit
+        
+        # If no good broadcast thermal, search known thermals
+        if not best_thermal:
+            for thermal in thermals:
+                if not thermal.active(t):
+                    continue
+                    
+                benefit = self.calculate_thermal_benefit(thermal)
+                if benefit > best_benefit and benefit > self.benefit_threshold:
+                    best_thermal = thermal
+                    best_benefit = benefit
+        
+        # Initiate exploitation if found
+        if best_thermal:
+            self.eagle_logger.info(f"Pursuing thermal with benefit={best_benefit:.0f}J")
+            if hasattr(best_thermal, 'id'):
+                self._compete_for_thermal(best_thermal, best_benefit)
+            else:
+                # Direct exploitation of discovered thermal
+                self._initiate_thermal_exploitation(best_thermal, t)
+    
+    def _announce_discoveries(self, thermals: List[Thermal], events: List[GroundEvent], t: float):
+        """Announce newly discovered thermals and events"""
+        # Announce new thermals
+        for thermal in thermals:
+            th_key = self._thermal_key(thermal.center, thermal.top_height, thermal.radius)
+            
+            if th_key not in self.detected_thermal_ids:
+                self.detected_thermal_ids.add(th_key)
+                
+                # Check if worth announcing (positive benefit)
+                benefit = self.calculate_thermal_benefit(thermal)
+                if benefit > 0:
+                    self.comm.broadcast(
+                        self.uav_id,
+                        MessageType.THERMAL_DISCOVERED,
+                        {
+                            "thermal_id": th_key,
+                            "position": thermal.center.tolist(),
+                            "strength": thermal.strength,
+                            "radius": thermal.radius,
+                            "top_height": thermal.top_height,
+                            "benefit_score": benefit
+                        }
+                    )
+                    self.eagle_logger.info(f"Announced thermal {th_key} with benefit={benefit:.0f}J")
+    
+    def _claim_and_investigate(self, event: GroundEvent):
+        """Claim an event and start investigation"""
+        self.assigned_event = event
+        self.investigated_event_ids.add(event.id)
+        
+        # Broadcast claim
+        self.comm.broadcast(
+            self.uav_id,
+            MessageType.TASK_CLAIMED,
+            {
+                "event_id": event.id,
+                "winner_id": self.uav_id
+            }
+        )
+        
+        # Start investigation
+        self._start_event_investigation(event.cx, event.cy)
+    
+    def _update_auctions(self, t: float):
+        # EVENTS
+        for event_id, A in list(self.active_event_auctions.items()):
+            if A.resolved:
+                continue
+            # settle tier by tier
+            elapsed = t - A.start_time
+            tier_idx = min(int(elapsed // self.tier_timeout), len(AgentTier)-1)
+            # when we *enter* a new tier, try to settle previous tier
+            if tier_idx > A.current_tier or elapsed >= self.auction_timeout:
+                prev_tier = list(AgentTier)[A.current_tier].value
+                bids = A.tier_bids.get(prev_tier, [])
+                if bids:
+                    winner_id, min_cost = min(bids, key=lambda x: (x[1], x[0]))
+                    A.winner_id, A.resolved = winner_id, True
+                    # award and notify
+                    self.comm.broadcast(self.uav_id, MessageType.TASK_CLAIMED,
+                                        {"event_id": event_id, "winner_id": winner_id})
+                    if winner_id == self.uav_id:
+                        self._claim_and_investigate(A.event)
+                A.current_tier = tier_idx
+            # hard timeout → last resort for initiator
+            if not A.resolved and elapsed >= self.auction_timeout and A.initiator_id == self.uav_id:
+                self._claim_and_investigate(A.event)
+                A.resolved = True
+            if A.resolved:
+                del self.active_event_auctions[event_id]
+                self.my_event_bids.discard(event_id)
+
+        # THERMALS
+        for th_id, T in list(self.active_thermal_auctions.items()):
+            if T.resolved:
+                continue
+            elapsed = t - T.start_time
+            if elapsed >= self.tier_timeout:  # simple one-shot settle
+                if T.bids:
+                    winner_id, best = max(T.bids, key=lambda x: (x[1], x[0]))
+                    T.winner_id, T.resolved = winner_id, True
+                    self.comm.broadcast(self.uav_id, MessageType.THERMAL_CLAIMED,
+                                        {"thermal_id": th_id, "winner_id": winner_id})
+                    if winner_id == self.uav_id:
+                        self._initiate_thermal_exploitation(T.thermal, t)
+                else:
+                    # no interest; let it expire
+                    T.resolved = True
+            if T.resolved:
+                del self.active_thermal_auctions[th_id]
+                self.my_thermal_bids.discard(th_id)
+    
+    def _compete_for_thermal(self, thermal: Thermal, benefit_score: float):
+        """Compete for a thermal through bidding (Algorithm 10)"""
+        th_key = self._thermal_key(thermal.center, thermal.top_height, thermal.radius)
+        
+        if benefit_score <= 0:
+            return
+        
+        # Submit bid
+        self.comm.broadcast(
+            self.uav_id,
+            MessageType.LIVE_THERMAL_BID,
+            {
+                "thermal_id": th_key,
+                "benefit_score": benefit_score,
+                "agent_id": self.uav_id
+            }
+        )
+        
+        self.my_thermal_bids.add(th_key)
+        self.eagle_logger.info(f"Bid on thermal {th_key} with benefit={benefit_score:.0f}J")
+    
+    def _handle_handover_request_msg(self, msg: Message, t: float):
+        """Handle incoming handover request message"""
+        event_id = msg.data["event_id"]
+        
+        if event_id not in self.active_event_auctions:
+            # Create new auction entry
+            # Note: We don't have the full event object, so create a minimal one
+            event = GroundEvent(
+                cx=msg.data["position"][0],
+                cy=msg.data["position"][1],
+                level=msg.data["event_level"]
+            )
+            event.id = event_id
+            
+            auction = EventAuction(
+                event_id=event_id,
+                event=event,
+                initiator_id=msg.sender_id,
+                start_time=msg.data["detection_time"],
+                tier_bids={tier.value: [] for tier in AgentTier}
+            )
+            self.active_event_auctions[event_id] = auction
+    
+    def _handle_event_bid_msg(self, msg: Message):
+        """Handle incoming event bid"""
+        event_id = msg.data["event_id"]
+        
+        if event_id in self.active_event_auctions:
+            auction = self.active_event_auctions[event_id]
+            tier = msg.data["tier"]
+            bid_cost = msg.data["bid_cost"]
+            agent_id = msg.data["agent_id"]
+            
+            auction.tier_bids[tier].append((agent_id, bid_cost))
+    
+    def _handle_task_claimed_msg(self, msg: Message):
+        """Handle task claimed message"""
+        event_id = msg.data["event_id"]
+        winner_id = msg.data["winner_id"]
+        
+        # Mark auction as resolved
+        if event_id in self.active_event_auctions:
+            self.active_event_auctions[event_id].resolved = True
+            self.active_event_auctions[event_id].winner_id = winner_id
+        
+        # Remove from our bids
+        self.my_event_bids.discard(event_id)
+    
+    def _handle_thermal_discovered_msg(self, msg: Message):
+        """Handle thermal discovery announcement"""
+        th_key = self._thermal_key(msg.data["position"], msg.data["top_height"], msg.data["radius"])
+        if th_key in self.active_thermal_auctions:
+            return
+        
+        # Create thermal object from message
+        thermal = Thermal(
+            center=(msg.data["position"][0], msg.data["position"][1]),
+            condition='Medium',  # Default condition
+            t0=msg.timestamp
+        )
+        # Override the sampled values with received data
+        thermal.strength = msg.data["strength"]
+        thermal.radius = msg.data["radius"]
+        thermal.top_height = msg.data["top_height"]
+        
+        auction = ThermalAuction(
+            thermal_id=th_key,
+            thermal=thermal,
+            initiator_id=msg.sender_id,
+            start_time=msg.timestamp,
+            bids=[]
+        )
+        self.active_thermal_auctions[th_key] = auction
+    
+    def _handle_thermal_bid_msg(self, msg: Message):
+        """Handle thermal bid"""
+        thermal_id = msg.data["thermal_id"]
+        
+        if thermal_id in self.active_thermal_auctions:
+            auction = self.active_thermal_auctions[thermal_id]
+            agent_id = msg.data["agent_id"]
+            benefit = msg.data["benefit_score"]
+            
+            auction.bids.append((agent_id, benefit))
+    
+    def _handle_thermal_claimed_msg(self, msg: Message):
+        """Handle thermal claimed message"""
+        thermal_id = msg.data["thermal_id"]
+        winner_id = msg.data["winner_id"]
+        
+        if thermal_id in self.active_thermal_auctions:
+            self.active_thermal_auctions[thermal_id].resolved = True
+            self.active_thermal_auctions[thermal_id].winner_id = winner_id
+        
+        self.my_thermal_bids.discard(thermal_id)
+    
+    def _update_peer_state(self, msg: Message):
+        """Update peer state from heartbeat"""
+        peer_id = msg.sender_id
+        self.peer_states[peer_id] = {
+            "position": msg.data.get("position"),
+            "battery_pct": msg.data.get("battery_pct"),
+            "tier": msg.data.get("tier"),
+            "mode": msg.data.get("mode"),
+            "timestamp": msg.timestamp
+        }
+    
+    def broadcast_state(self):
+        """Broadcast own state to peers"""
+        self.comm.broadcast(
+            self.uav_id,
+            MessageType.AGENT_STATE,
+            {
+                "position": self.pos.tolist(),
+                "battery_pct": self.battery_pct(),
+                "tier": self.get_tier().value,
+                "mode": self.flight_mode,
+                "soaring_state": self.soaring_state,
+                "event_mode": self.event_mode
+            }
+        )
+
+
+# Collision avoidance implementation
+class CollisionAvoidance:
+    """
+    Artificial Potential Field collision avoidance
+    Based on Section 3.1 of the EAGLE formulation
+    """
+    
+    def __init__(self,
+                 d_safe: float = 100.0,      # Minimum UAV separation
+                 d_obs_safe: float = 150.0,  # Minimum obstacle clearance
+                 r_safe: float = 50.0,       # Safety radius
+                 r_turn: float = 30.0):      # Turn radius
+        
+        self.d_safe = d_safe
+        self.d_obs_safe = d_obs_safe
+        self.r_safe = r_safe
+        self.r_turn = r_turn
+        
+        # Activation radius (Eq. 19b)
+        self.r_a = math.sqrt((r_safe + r_turn)**2 - r_turn**2)
+    
+    def calculate_avoidance_velocity(self,
+                                   own_pos: np.ndarray,
+                                   own_vel: np.ndarray,
+                                   goal_vel: np.ndarray,
+                                   neighbors: List[Dict[str, np.ndarray]],
+                                   obstacles: List[Dict[str, np.ndarray]] = None,
+                                   config: PhoenixConfig = None,  # Add config parameter
+                                   current_heading: float = 0.0,  # Add heading parameter
+                                   dt: float = 1.0) -> np.ndarray:  # Add dt parameter
+        """
+        Calculate collision-free velocity command using APF
+        
+        Args:
+            own_pos: Own position [x, y, z]
+            own_vel: Own velocity [vx, vy, vz]
+            goal_vel: Desired velocity vector
+            neighbors: List of {'pos': [x,y,z], 'vel': [vx,vy,vz]}
+            obstacles: List of {'pos': [x,y,z], 'vel': [vx,vy,vz]}
+            config: Configuration object for limits
+            current_heading: Current heading angle
+            dt: Time step for integration
+        
+        Returns:
+            Commanded velocity vector
+        """
+        v_cmd = goal_vel.copy()
+        
+        # sum repulsions
+        for neighbor in neighbors:
+            v_rep = self._repulsive_velocity(
+                own_pos, own_vel,
+                neighbor['pos'], neighbor['vel'],
+                self.d_safe
+            )
+            v_cmd += v_rep
+        
+        # Add repulsive velocities from obstacles
+        if obstacles:
+            for obstacle in obstacles:
+                v_rep = self._repulsive_velocity(
+                    own_pos, own_vel,
+                    obstacle['pos'], obstacle['vel'],
+                    self.d_obs_safe
+                )
+                v_cmd += v_rep
+        
+        # Use passed parameters instead of self references
+        if config:
+            V_max = config.V_cmd_max
+            V_min = config.V_cmd_min
+            k_psi = config.k_psi
+            psi_dot_max = config.psi_dot_max
+        else:
+            # Defaults
+            V_max = 25.0
+            V_min = 12.0
+            k_psi = 1.0
+            psi_dot_max = 0.5
+        
+        # project to feasible envelope
+        if np.linalg.norm(v_cmd) > V_max:
+            v_cmd = v_cmd / np.linalg.norm(v_cmd) * V_max
+        # map to achievable course-rate
+        psi_goal = math.atan2(v_cmd[1], v_cmd[0])
+        psi_err  = np.arctan2(np.sin(psi_goal - current_heading), np.cos(psi_goal - current_heading))
+        psi_dot  = np.clip(k_psi * psi_err, -psi_dot_max, psi_dot_max)
+        # Return desired *velocity* consistent with limited heading rate
+        V = np.clip(np.linalg.norm(v_cmd), V_min, V_max)
+        psi_next = current_heading + psi_dot * dt
+        return np.array([V * np.cos(psi_next), V * np.sin(psi_next), v_cmd[2]])
+    
+    def _repulsive_velocity(self,
+                           p_i: np.ndarray,
+                           v_i: np.ndarray,
+                           p_j: np.ndarray,
+                           v_j: np.ndarray,
+                           d_min: float) -> np.ndarray:
+        """
+        Calculate repulsive velocity from a single neighbor/obstacle
+        Implements Equations 19a and 19b from formulation
+        """
+        # Relative position
+        r = p_i - p_j
+        d = np.linalg.norm(r)
+        
+        # Too far to matter
+        if d > 2 * d_min:
+            return np.zeros(3)
+        
+        # Relative velocity
+        v_rel = v_i - v_j
+        
+        # Approach speed (positive if approaching)
+        if d > 1e-6:
+            u_r = -np.dot(v_rel, r/d)
+        else:
+            u_r = np.linalg.norm(v_rel)
+        
+        # Only repel if approaching
+        if u_r <= 0:
+            return np.zeros(3)
+        
+        # Source flow strength (Eq. 19b)
+        Q = 4 * np.pi * self.r_a**2 * u_r
+        
+        # Repulsive velocity (Eq. 19a)
+        if d > 1e-6:
+            v_ind = Q * r / (4 * np.pi * d**3)
+        else:
+            # At singularity, repel radially
+            v_ind = np.array([Q/(4*np.pi), 0, 0])
+        
+        # Cap the APF singularity
+        v_cap = 10.0  # m/s maximum repulsive velocity
+        v_ind = np.clip(v_ind, -v_cap, v_cap)
+        
+        return v_ind
