@@ -1,4 +1,4 @@
-"""Configuration for UAV simulation"""
+
 
 from dataclasses import dataclass, field
 import numpy as np
@@ -8,7 +8,7 @@ import math
 # ============================ Centralized File Paths ============================
 # 🎯 SINGLE SOURCE OF TRUTH: Change this path to update ALL modules automatically
 # All modules (adj_regions_path.py, sim.py, events.py) import from here
-GEOJSON_PATH = "/home/px4_sitl/ets_work/code/project_montreal/limites-administratives-agglomeration-nad83.geojson"
+GEOJSON_PATH = "/home/px4_sitl/ets_work/code/updated_project_montreal/limites-administratives-agglomeration-nad83.geojson"
 UTM_CRS = "EPSG:32618"
 
 # ============================ Shared Utilities ============================

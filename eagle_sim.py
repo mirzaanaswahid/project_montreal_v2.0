@@ -8,6 +8,7 @@ import time
 import numpy as np
 import json
 import os
+import glob
 from typing import List, Dict, Optional, Tuple
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -20,17 +21,31 @@ from communication import CommunicationNetwork
 from world import SimulationWorld
 
 
+# ------------- new helper -----------------
+def planned_uav_count():
+    if os.path.exists("waypoints_planning.json"):
+        with open("waypoints_planning.json") as f:
+            meta = json.load(f).get("meta", {})
+            if "total_uavs" in meta:
+                return int(meta["total_uavs"])
+    # fallback: count per-UAV files
+    return len(glob.glob("waypoints_agent__*.json"))
+
+
 class EAGLESimulation:
     """
     Main simulation class for EAGLE multi-UAV system
     """
     
     def __init__(self,
-                 num_agents: int = 3,
+                 num_agents: Optional[int] = None,
                  mission_duration: float = 3600.0,  # seconds
                  dt: float = 1.0,                   # time step
                  enable_visualization: bool = True):
         
+        # ------------- inside EAGLESimulation.__init__ -------------
+        if num_agents is None:           # allow None to mean "auto"
+            num_agents = planned_uav_count()
         self.num_agents = num_agents
         self.mission_duration = mission_duration
         self.dt = dt
@@ -451,7 +466,7 @@ class EAGLESimulation:
 if __name__ == "__main__":
     # Create and run simulation
     sim = EAGLESimulation(
-        num_agents=3,
+        num_agents=None,  # Auto-detect from coverage planner
         mission_duration=1800.0,  # 30 minutes
         dt=1.0,
         enable_visualization=True
