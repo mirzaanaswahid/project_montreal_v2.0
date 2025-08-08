@@ -311,7 +311,7 @@ class EAGLESimulation:
                         agent.vz  = float(safe_vel[2])
             
             # Update agent with EAGLE logic
-            agent.update(self.dt, self.current_time, thermals, events)
+            agent.update(self.dt, self.current_time, thermals, events, self.world)
             
             # Broadcast state periodically
             if self.current_time % 10 < self.dt:  # Every 10 seconds

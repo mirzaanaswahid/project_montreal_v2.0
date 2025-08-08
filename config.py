@@ -5,9 +5,6 @@ import numpy as np
 import unicodedata
 import math
 
-# ============================ Centralized File Paths ============================
-# 🎯 SINGLE SOURCE OF TRUTH: Change this path to update ALL modules automatically
-# All modules (adj_regions_path.py, sim.py, events.py) import from here
 GEOJSON_PATH = "/home/px4_sitl/ets_work/code/updated_project_montreal/limites-administratives-agglomeration-nad83.geojson"
 UTM_CRS = "EPSG:32618"
 
@@ -37,9 +34,6 @@ class PhoenixConfig:
     cruise_speed        = 18.0      # m/s
     min_speed           = 12.0
     max_speed           = 25.0
-
-    # NEW — global mission altitude (was hard‑coded 30 m)
-    cruise_alt_m        = 400.0     # PATCH
 
     # turn, accel, climb limits …
     turn_rate_max       = math.radians(30)   # rad/s
@@ -85,7 +79,6 @@ class PhoenixConfig:
     prop_eta: float = 0.85  # Propeller efficiency
     
     # Operational parameters
-    altitude_ref: float = 400.0  # Reference altitude (m)
     alt_band_m: float = 100.0  # Altitude band (±m)
     V_range_opt: float = 18.0  # Optimal range speed (m/s)
     V_loiter: float = 15.0  # Loiter speed (m/s)
@@ -100,3 +93,9 @@ class PhoenixConfig:
     V_cmd_max: float = 25.0
     k_psi: float = 1.0  # Heading control gain
     psi_dot_max: float = 0.5  # Max heading rate (rad/s)
+    
+    # Soaring parameters
+    altitude_ref_m: float = 400.0  # Reference altitude for soaring (m)
+    altitude_max_soar_m: float = 800.0  # max climb when exploiting thermals
+    thermal_detour_max_km: float = 2.0  # max extra distance willing to travel
+    thermal_conf_min: float = 0.6  # min confidence to engage

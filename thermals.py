@@ -159,6 +159,15 @@ class Thermal:
         
         return float(self.strength * radial_factor * height_factor)
 
+    def expected_gain_wh(self, current_alt_m: float, mass_kg: float, conf_factor: float = 1.0) -> float:
+        """
+        Gross potential energy you could gain by climbing from current_alt to top_height.
+        Returns Watt-hours (Wh).
+        """
+        dh = max(0.0, self.top_height - current_alt_m)
+        pe_j = mass_kg * 9.81 * dh
+        return (pe_j / 3600.0) * conf_factor
+
     # -------------------------- viz convenience ----------------------------
     def get_visualization_data(self) -> dict:
         return {

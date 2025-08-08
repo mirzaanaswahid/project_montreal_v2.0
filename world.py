@@ -242,27 +242,37 @@ class SimulationWorld:
         else:
             return [e for e in self.events if e.active(self.sim_time)]
     
-    def get_wind_at_position(self, pos: np.ndarray) -> np.ndarray:
+    def get_nearby_thermals(self, pos, max_dist_m):
+        """Return active thermals within max_dist_m of pos."""
+        nearby = []
+        for th in self.get_active_thermals():
+            dx = th.center[0] - pos[0]
+            dy = th.center[1] - pos[1]
+            if (dx*dx + dy*dy)**0.5 <= max_dist_m:
+                nearby.append(th)
+        return nearby
+    
+    def get_wind_at_position(self, pos):
         """
-        Get wind vector at a position (including thermal effects)
+        Return horizontal and vertical wind components at pos.
+        Now includes thermal updraft if inside a thermal.
+        """
+        vx, vy, vz = 0.0, 0.0, 0.0
         
-        Args:
-            pos: [x, y, z] position
-            
-        Returns:
-            Wind vector [vx, vy, vz] in m/s
-        """
         # Base wind
         if self.weather_enabled:
             wind = self.weather.get_wind_vector()
-        else:
-            wind = np.zeros(3)
+            vx, vy = wind[0], wind[1]
         
         # Add thermal updrafts
-        for thermal in self.get_active_thermals():
-            wind[2] += thermal.w(pos, self.sim_time)
+        for th in self.get_active_thermals():
+            dx = th.center[0] - pos[0]
+            dy = th.center[1] - pos[1]
+            dist = (dx*dx + dy*dy)**0.5
+            if dist <= th.radius and th.base_height <= pos[2] <= th.top_height:
+                vz += th.w(pos, self.sim_time)
         
-        return wind
+        return vx, vy, vz
     
     def save_snapshot(self, filename: str = "world_snapshot.json"):
         """Save current world state"""

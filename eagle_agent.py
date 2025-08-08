@@ -140,8 +140,8 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         
         # Thermal policy
         self.thermal_policy = ThermalPolicy.STRICT_ALT
-        self.alt_band = (self.cfg.altitude_ref - self.cfg.alt_band_m,
-                         self.cfg.altitude_ref + self.cfg.alt_band_m)
+        self.alt_band = (self.cfg.altitude_ref_m - self.cfg.alt_band_m,
+                         self.cfg.altitude_ref_m + self.cfg.alt_band_m)
         
         # Energy tracking
         self.cmotor_J = 0.0           # Σ u_k * P_elec,k * Δt
@@ -182,6 +182,14 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         logger.setLevel(logging.INFO)
         return logger
     
+    def _Wh(self, J: float) -> float:
+        """Convert Joules to Watt-hours"""
+        return J / 3600.0
+    
+    def _J(self, Wh: float) -> float:
+        """Convert Watt-hours to Joules"""
+        return Wh * 3600.0
+    
     # Add missing basic flight methods
     def arm(self):
         """Arm the UAV"""
@@ -192,7 +200,7 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
     def takeoff(self, target_alt_m: float = None):
         """Initiate takeoff"""
         if target_alt_m is None:
-            target_alt_m = self.cfg.cruise_alt_m
+            target_alt_m = self.cfg.altitude_ref_m
         
         self.target_alt = target_alt_m
         self.target_speed = self.cfg.cruise_speed
@@ -227,7 +235,7 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         self.target_speed = speed
         self.V_h = speed
     
-    def update(self, dt: float, t: float, thermals: List[Thermal], events: List[GroundEvent]):
+    def update(self, dt: float, t: float, thermals: List[Thermal], events: List[GroundEvent], world=None):
         """Main update method - single public entry point for agent updates"""
         # Store environment
         self.current_thermals = thermals or []
@@ -235,6 +243,11 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         
         # Update simulation time
         self.t = t
+        
+        # pull wind (incl. vertical updraft) from the world
+        if world is not None:
+            vx, vy, vz = world.get_wind_at_position(self.pos)
+            self.cfg.wind_enu[:] = [vx, vy, vz]  # reuse existing paths
         
         # Run EAGLE decision-making step
         self._eagle_step(dt, t, thermals, events)
@@ -475,18 +488,45 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
 
         return E_transit + E_loiter
     
-    def calculate_thermal_benefit(self, thermal: Thermal) -> float:
+    def calculate_thermal_benefit(self, thermal_or_msg) -> float:
         p = self.pos.copy()
-        r_xy = np.linalg.norm(p[:2] - np.array(thermal.center[:2]))
+        
+        # Handle both Thermal objects and message dictionaries
+        if isinstance(thermal_or_msg, dict):
+            # Message dictionary case
+            center = np.array(thermal_or_msg["position"])
+            radius = thermal_or_msg["radius"]
+            strength = thermal_or_msg["strength"]
+            top_height = thermal_or_msg.get("top_height", p[2] + 10.0)
+            base_height = thermal_or_msg.get("base_height", 0.0)
+            spawn_time = thermal_or_msg.get("spawn_time", -1e12)
+            end_time = thermal_or_msg.get("end_time", 1e12)
+            
+            # Check if thermal is still active
+            if not (spawn_time <= self.tnow < end_time):
+                return -np.inf
+                
+            # Calculate time remaining
+            time_remaining = end_time - self.tnow
+        else:
+            # Thermal object case
+            center = np.array(thermal_or_msg.center[:2])
+            radius = thermal_or_msg.radius
+            strength = thermal_or_msg.strength
+            top_height = thermal_or_msg.top_height
+            base_height = getattr(thermal_or_msg, "base_height", 0.0)
+            time_remaining = thermal_or_msg.time_remaining(self.tnow)
+        
+        r_xy = np.linalg.norm(p[:2] - center)
         # time to enter disk, assume straight-line at V_cruise
         t_entry = r_xy / max(self.ground_speed(self.cfg.V_range_opt), 1.0)
 
         # estimate average climb within usable core
-        w_bar = self._expected_wair(thermal, p[:2])  # m/s vertical airmass
+        w_bar = self._expected_wair(thermal_or_msg, p[:2])  # works for Thermal or msg dict
         if w_bar <= 0.2:  # below threshold
             return -np.inf
 
-        dwell = min(self.cfg.max_thermal_dwell_s, thermal.time_remaining(self.tnow) - t_entry)
+        dwell = min(self.cfg.max_thermal_dwell_s, time_remaining - t_entry)
         if dwell <= 0:
             return -np.inf
 
@@ -497,33 +537,82 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
             E_gain  = E_saved
         else:
             # climb within band
-            hmax = min(self.alt_band[1], thermal.top_height)
+            hmax = min(self.alt_band[1], top_height)
             dh   = max(0.0, hmax - p[2])
             t_climb = min(dwell, dh / w_bar)
             E_saved = self._loiter_power_in_still_air() * t_climb * self.cfg.motor_cut_fraction
             E_gain  = self.cfg.mass * 9.81 * (w_bar * t_climb)  # potential energy gained
 
         # detour is incremental path-length vs planned next waypoint
-        d_detour = self._incremental_detour_length(thermal.center[:2])
+        d_detour = self._incremental_detour_length(center[:2])
         E_detour = self._specific_energy_per_meter(self.cfg.V_range_opt, self.wind_xy) * d_detour
 
-        C = self._thermal_confidence(thermal)  # [0,1] from tracker/variometer SNR
+        C = self._thermal_confidence(thermal_or_msg)  # [0,1] from tracker/variometer SNR
         return C * (E_gain + E_saved) - E_detour
     
-    def _expected_wair(self, thermal: Thermal, pos_xy: np.ndarray) -> float:
+    def _expected_wair_from_metrics(self, th_msg: dict, x: float, y: float, z: float, t: float) -> float:
         """
-        Estimate average vertical airspeed within thermal core
+        Compute vertical airspeed (m/s) from a thermal message only.
+        No direct calls to world or Thermal object.
+        Fields expected in th_msg:
+          - "position": [cx, cy]
+          - "radius": float
+          - "strength": float            # max updraft at core (m/s)
+          - "base_height": float         # OPTIONAL (default 0)
+          - "top_height": float
+          - "spawn_time": float          # OPTIONAL (defaults to -inf)
+          - "end_time": float            # OPTIONAL (defaults to +inf)
         """
-        # Distance from thermal center
-        r = np.linalg.norm(pos_xy - thermal.center[:2])
-        
-        # Simple model: linear decay from center strength
-        if r <= thermal.radius:
-            # Within core - use full strength
-            return thermal.strength
-        else:
-            # Outside core - decay with distance
-            return max(0.0, thermal.strength * (thermal.radius / r))
+        cx, cy = th_msg["position"][0], th_msg["position"][1]
+        radius = float(th_msg["radius"])
+        strength = float(th_msg["strength"])
+        z_base = float(th_msg.get("base_height", 0.0))
+        z_top  = float(th_msg.get("top_height", z_base + 10.0))
+
+        t0 = float(th_msg.get("spawn_time", -1e12))
+        t1 = float(th_msg.get("end_time",  1e12))
+
+        # time active?
+        if not (t0 <= t < t1):
+            return 0.0
+
+        # altitude inside band?
+        if z < z_base or z > z_top:
+            return 0.0
+
+        # horizontal distance
+        dist = math.hypot(x - cx, y - cy)
+        if dist > radius:
+            return 0.0
+
+        # same shape as your thermals.py: linear radial decay
+        radial = max(0.0, 1.0 - dist / max(radius, 1e-6))
+
+        # height envelope (bell/triangle peaking ~70% up the column)
+        span = max(1e-6, z_top - z_base)
+        hz = (z - z_base) / span
+        height = hz/0.7 if hz <= 0.7 else (1.0 - hz) / 0.3
+        height = max(0.0, min(1.0, height))
+
+        return strength * radial * height
+
+    def _expected_wair(self, thermal_or_msg, pos_xy: np.ndarray) -> float:
+        """
+        If we got a live Thermal object → use its w((x,y,z), t).
+        If we only have a broadcast message dict → use metrics-only helper.
+        """
+        x, y, z = pos_xy[0], pos_xy[1], self.pos[2]
+
+        # Case A: real Thermal object
+        if hasattr(thermal_or_msg, "w"):
+            return max(0.0, float(thermal_or_msg.w((x, y, z), self.tnow)))
+
+        # Case B: message dict from comms
+        if isinstance(thermal_or_msg, dict):
+            return max(0.0, float(self._expected_wair_from_metrics(thermal_or_msg, x, y, z, self.tnow)))
+
+        # Unknown type
+        return 0.0
     
     def _loiter_power_in_still_air(self) -> float:
         """
@@ -576,9 +665,79 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         th, r = round(top_height, 0), round(radius, 1)
         return f"th_{x}_{y}_{th}_{r}"
 
-    def _thermal_confidence(self, thermal: Thermal) -> float:
+    def _thermal_confidence(self, thermal_or_msg) -> float:
         # Example: clamp from tracker variance or variometer SNR
-        return np.clip(thermal.confidence if hasattr(thermal, "confidence") else 0.6, 0.0, 1.0)
+        if isinstance(thermal_or_msg, dict):
+            # Message dictionary case - use default confidence
+            return 0.6
+        else:
+            # Thermal object case
+            return np.clip(thermal_or_msg.confidence if hasattr(thermal_or_msg, "confidence") else 0.6, 0.0, 1.0)
+    
+    def _distance_to(self, target_pos) -> float:
+        if isinstance(target_pos, (list, tuple, np.ndarray)):
+            tp = np.array(target_pos, dtype=float)
+            return np.linalg.norm(self.pos[:2] - tp[:2])
+        return float('inf')
+
+    def _goto(self, x: float, y: float):
+        vec = np.array([x, y]) - self.pos[:2]
+        if np.linalg.norm(vec) > 1.0:
+            self.target_heading = math.atan2(vec[0], vec[1])
+            # heading rate limited in _fly_towards_target
+
+    def _climb(self, target_alt: float):
+        alt_diff = target_alt - self.pos[2]
+        if abs(alt_diff) > 0.5:
+            self.target_alt = np.clip(target_alt, self.alt_band[0], self.cfg.altitude_max_soar_m)
+
+    def _goto_patrol_route(self):
+        if self.waypoints and 0 <= self.current_wp_index < len(self.waypoints):
+            wp = self.waypoints[self.current_wp_index]
+            self._goto(wp[0], wp[1])
+            self.target_alt = self.cfg.altitude_ref_m  # stay in patrol layer after soaring
+
+    def _fly_towards_target(self):
+        # heading
+        if hasattr(self, 'target_heading'):
+            err = math.atan2(math.sin(self.target_heading - self.psi), math.cos(self.target_heading - self.psi))
+            self.psi += np.clip(self.cfg.k_psi * err, -self.cfg.psi_dot_max, self.cfg.psi_dot_max) * self.dt
+        # speed
+        if hasattr(self, 'target_speed'):
+            self.V_h += np.clip(self.target_speed - self.V_h, -1.0, 1.0) * 0.1 * self.dt
+            self.V_h = np.clip(self.V_h, self.cfg.V_cmd_min, self.cfg.V_cmd_max)
+        # altitude
+        if hasattr(self, 'target_alt'):
+            alt_err = self.target_alt - self.pos[2]
+            self.vz = np.clip(0.2 * alt_err, self.cfg.descent_rate, self.cfg.climb_rate)
+
+    def _simple_thermal_step(self, sim_time, world):
+        decision = "patrol"
+        self.target_alt = self.cfg.altitude_ref_m
+
+        # candidate thermals within detour range
+        thermals = world.get_nearby_thermals(self.pos, self.cfg.thermal_detour_max_km * 1000)
+        best, best_score = None, -1e18
+
+        for th in thermals:
+            conf = self._thermal_confidence(th)
+            if conf < self.cfg.thermal_conf_min or not th.active(sim_time):
+                continue
+            benefit_J = self.calculate_thermal_benefit(th)  # J
+            if benefit_J > best_score and benefit_J > self.benefit_threshold:
+                best, best_score = th, benefit_J
+
+        if best is not None:
+            decision = "soar"
+            self._goto(best.center[0], best.center[1])
+            if self._distance_to(best.center) <= best.radius and self.pos[2] < self.cfg.altitude_max_soar_m:
+                self._climb(self.cfg.altitude_max_soar_m)
+            elif self.pos[2] >= self.cfg.altitude_max_soar_m or not best.active(sim_time):
+                self._goto_patrol_route()
+                self.target_alt = self.cfg.altitude_ref_m
+
+        self._fly_towards_target()
+        return decision
     
     def _eagle_step(self, dt: float, t: float, thermals: List[Thermal], events: List[GroundEvent]):
         """
@@ -607,9 +766,9 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         elif self._handle_handover_requests(t):
             pass  # Handled in method
             
-        # Check 3: Energy management (thermal soaring)
-        elif self.battery_pct() < 50.0:  # LOW_THRESHOLD
-            self._handle_proactive_soaring(thermals, t)
+        # Check 3: Cooperative thermal decision (always-on)
+        elif self._cooperative_thermal_step(thermals, t):
+            pass  # either bid, claimed, or enroute to thermal
             
         # Check 4: Default behaviors
         else:
@@ -826,11 +985,14 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
                         MessageType.THERMAL_DISCOVERED,
                         {
                             "thermal_id": th_key,
-                            "position": thermal.center.tolist(),
+                            "position": list(thermal.center),  # fix tuple→list
                             "strength": thermal.strength,
                             "radius": thermal.radius,
+                            "base_height": getattr(thermal, "base_height", 0.0),
                             "top_height": thermal.top_height,
-                            "benefit_score": benefit
+                            "spawn_time": getattr(thermal, "spawn_time", self.tnow),
+                            "end_time":   getattr(thermal, "end_time",   self.tnow + 300.0),
+                            "benefit_score": float(benefit)
                         }
                     )
                     self.eagle_logger.info(f"Announced thermal {th_key} with benefit={benefit:.0f}J")
@@ -987,6 +1149,14 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         thermal.strength = msg.data["strength"]
         thermal.radius = msg.data["radius"]
         thermal.top_height = msg.data["top_height"]
+        
+        # Handle optional fields
+        if "base_height" in msg.data:
+            thermal.base_height = msg.data["base_height"]
+        if "spawn_time" in msg.data:
+            thermal.spawn_time = msg.data["spawn_time"]
+        if "end_time" in msg.data:
+            thermal.end_time = msg.data["end_time"]
         
         auction = ThermalAuction(
             thermal_id=th_key,
