@@ -288,18 +288,33 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
             self.cmotor_J += float(self.P_elec) * dt  # J = W * s
     
     def _update_power(self):
-        """Calculate power consumption"""
+        """Power with avionics assumed zero."""
+        # Motor off in soaring/gliding
         if self.soaring_state in ("thermal_exploitation", "gliding"):
+            self.throttle = 0.0
             self.P_elec = 0.0
             return
-        
+
+        # Not moving → no draw
         if self.V_h < 0.1:
             self.throttle = 0.0
-            self.P_elec = self.cfg.p_avionics
+            self.P_elec = 0.0
             return
-        
-        # Simplified power model
-        self.P_elec = self.cfg.max_motor_power_w * self.throttle + self.cfg.p_avionics
+
+        # Aerodynamic/mech power → electrical via prop efficiency
+        rho = self.cfg.air_density
+        S   = self.cfg.wing_area
+        CD0 = self.cfg.CD0
+        k   = self.cfg.induced_drag_k
+        W   = self.cfg.mass * 9.81
+        eta = max(self.cfg.prop_eta, 1e-3)
+
+        V = max(self.V_h, 0.1)
+        q = 0.5 * rho * V**2
+        D_par = q * S * CD0
+        D_ind = k * W**2 / (q * S)
+        P_aero = (D_par + D_ind) * V
+        self.P_elec = P_aero / eta
     
     def _update_flight_mode(self):
         """Update flight mode state machine"""
@@ -931,6 +946,71 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         self.my_event_bids.add(auction.event_id)
         self.eagle_logger.info(f"Submitted bid for event {auction.event_id}: cost={cost:.0f}J, tier={tier.value}")
     
+    def _cooperative_thermal_step(self, thermals: List[Thermal], t: float) -> bool:
+        """
+        Always-on cooperative thermal selection:
+        1) Prefer thermals already in auctions (shared).
+        2) If none, consider local world thermals and announce them.
+        3) Bid on the best one if benefit > threshold.
+        Return True if we took any action; else False.
+        """
+        best_thermal = None
+        best_benefit = -float('inf')
+
+        # 1) auctions first
+        for th_id, auction in self.active_thermal_auctions.items():
+            if th_id in self.my_thermal_bids:
+                continue
+            th = auction.thermal
+            if hasattr(th, "active") and not th.active(t):
+                continue
+            benefit = self.calculate_thermal_benefit(th)
+            if benefit > best_benefit and benefit > self.benefit_threshold:
+                best_thermal, best_benefit = th, benefit
+
+        # 2) then local world thermals
+        if best_thermal is None:
+            for th in thermals:
+                if not th.active(t):
+                    continue
+                benefit = self.calculate_thermal_benefit(th)
+                if benefit > best_benefit and benefit > self.benefit_threshold:
+                    best_thermal, best_benefit = th, benefit
+
+        if best_thermal is None:
+            return False
+
+        # If it's a world thermal and not announced yet, announce + open auction
+        if hasattr(best_thermal, 'id_int'):
+            th_key = self._thermal_key(best_thermal.center, best_thermal.top_height, best_thermal.radius)
+            if th_key not in self.active_thermal_auctions:
+                self.comm.broadcast(
+                    self.uav_id,
+                    MessageType.THERMAL_DISCOVERED,
+                    {
+                        "thermal_id": th_key,
+                        "position": list(best_thermal.center),
+                        "strength": best_thermal.strength,
+                        "radius": best_thermal.radius,
+                        "base_height": getattr(best_thermal, "base_height", 0.0),
+                        "top_height": best_thermal.top_height,
+                        "spawn_time": getattr(best_thermal, "spawn_time", self.tnow),
+                        "end_time":   getattr(best_thermal, "end_time",   self.tnow + 300.0),
+                        "benefit_score": float(best_benefit)
+                    }
+                )
+                self.active_thermal_auctions[th_key] = ThermalAuction(
+                    thermal_id=th_key,
+                    thermal=best_thermal,
+                    initiator_id=self.uav_id,
+                    start_time=self.tnow,
+                    bids=[]
+                )
+
+        # Bid (cooperative selection)
+        self._compete_for_thermal(best_thermal, best_benefit)
+        return True
+
     def _handle_proactive_soaring(self, thermals: List[Thermal], t: float):
         """
         Seek thermals when battery is low (Algorithm 7)
