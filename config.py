@@ -99,3 +99,13 @@ class PhoenixConfig:
     altitude_max_soar_m: float = 800.0  # max climb when exploiting thermals
     thermal_detour_max_km: float = 2.0  # max extra distance willing to travel
     thermal_conf_min: float = 0.6  # min confidence to engage
+    
+    # Probability map configuration
+    probmap_meta_path: str = "/path/to/probability_map_metadata.json"
+    probmap_prob_path: str = "/path/to/conditional_probability_map.npy"
+    probmap_avg_npz_path: str = "/path/to/average_thermal_metrics.npz"
+    probmap_lc_raster_path: str = "/path/to/landcover-2020-classification.tif"
+
+    # Runtime knobs
+    probmap_aoi_half_width_m: float = 500.0
+    probmap_probability_threshold: float = 0.5

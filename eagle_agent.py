@@ -148,6 +148,10 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         self.egain_J  = 0.0           # Σ B_i(t) for exploited thermals
         self._thermal_gain_booked = False
         
+        # Thermal state tracking
+        self._inside_thermal = False
+        self._lost_thermal_recently = False
+        
         # Logging
         self.eagle_logger = self._setup_eagle_logger()
     
@@ -289,8 +293,14 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
     
     def _update_power(self):
         """Power with avionics assumed zero."""
-        # Motor off in soaring/gliding
-        if self.soaring_state in ("thermal_exploitation", "gliding"):
+        # Motor off when gliding, period.
+        if self.soaring_state == "gliding":
+            self.throttle = 0.0
+            self.P_elec = 0.0
+            return
+
+        # Motor off only once actually INSIDE the thermal column
+        if self.soaring_state == "thermal_exploitation" and self._inside_thermal:
             self.throttle = 0.0
             self.P_elec = 0.0
             return
@@ -386,8 +396,13 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         else:
             # Circle around
             tangent = np.array([-vec[1], vec[0]])
-            tangent = tangent / np.linalg.norm(tangent)
-            self.target_heading = math.atan2(tangent[0], tangent[1])
+            n = np.linalg.norm(tangent)
+            if n > 1e-6:
+                tangent = tangent / n
+                self.target_heading = math.atan2(tangent[0], tangent[1])
+            else:
+                # gentle turn if we're basically centered
+                self.target_heading = self.psi + 0.1
         
         self.psi = self.target_heading
         self.V_h = self.cfg.V_loiter
@@ -397,32 +412,48 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         """Handle thermal soaring"""
         if self.current_thermal is None:
             self.soaring_state = "normal"
+            self._inside_thermal = False
             return
-        
-        # Simple spiral in thermal
+
+        th = self.current_thermal
         elapsed = self.t - self.exploitation_start_time
-        if elapsed > self.cfg.max_thermal_dwell_s:
+        if elapsed > self.cfg.max_thermal_dwell_s or not th.active(self.t):
             self.soaring_state = "normal"
             self.current_thermal = None
             self._thermal_gain_booked = False
+            self._inside_thermal = False
             return
-        
-        # Spiral pattern
-        angle = elapsed * 0.1  # radians per second
-        radius = 0.8 * self.current_thermal.radius
-        
+
+        # Are we inside the usable thermal column & altitude?
+        dist_xy = np.linalg.norm(self.pos[:2] - np.array(th.center))
+        alt_ok = (self.pos[2] >= getattr(th, "base_height", 0.0)) and (self.pos[2] <= th.top_height)
+        self._inside_thermal = (dist_xy <= th.radius) and alt_ok
+
+        if not self._inside_thermal:
+            # Navigate to thermal center with motor ON
+            self._goto(th.center[0], th.center[1])
+            self.target_speed = max(self.cfg.min_speed, self.cfg.V_cmd_min)
+            # climb toward band if below base
+            if self.pos[2] < getattr(th, "base_height", 0.0):
+                self._climb(min(self.cfg.altitude_max_soar_m, getattr(th, "base_height", 0.0)))
+            self._fly_towards_target()
+            return
+
+        # Inside column → spiral with motor OFF (handled by _update_power via flag)
+        angle = elapsed * 0.1  # rad/s
+        radius = 0.8 * th.radius
         target = np.array([
-            self.current_thermal.center[0] + radius * math.cos(angle),
-            self.current_thermal.center[1] + radius * math.sin(angle)
+            th.center[0] + radius * math.cos(angle),
+            th.center[1] + radius * math.sin(angle)
         ])
-        
         vec = target - self.pos[:2]
         if np.linalg.norm(vec) > 1.0:
             self.target_heading = math.atan2(vec[0], vec[1])
             self.psi = self.target_heading
-        
+
         self.V_h = self.cfg.min_speed
-        self.throttle = 0.0  # Motor off
+        # altitude managed by vertical updraft + small trims
+        self.vz = 0.0
     
     def _start_event_investigation(self, cx: float, cy: float):
         """Start investigating an event"""
@@ -435,9 +466,14 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         self.current_thermal = thermal
         self.soaring_state = "thermal_exploitation"
         self.exploitation_start_time = t
+        self._inside_thermal = False  # will be set true once actually inside
         self.eagle_logger.info(f"{self.uav_id} starting thermal exploitation")
-        
-        # Book the benefit once at start, per B_i(t) definition (Eq. 14)
+
+        # Head toward center; power stays on until _inside_thermal
+        self._goto(thermal.center[0], thermal.center[1])
+        self.target_speed = max(self.cfg.min_speed, self.cfg.V_cmd_min)
+
+        # Book the benefit once at start, per B_i(t)
         if not self._thermal_gain_booked:
             b = max(0.0, float(self.calculate_thermal_benefit(thermal)))
             self.egain_J += b
@@ -454,10 +490,15 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         else:
             return AgentTier.HEALTHY_NOMAD
     
-    def _specific_energy_per_meter(self, V_air: float, wind_xy: np.ndarray) -> float:
+    def _specific_energy_per_meter(self, V_air: float, wind_xy: np.ndarray, u_hat: np.ndarray|None=None) -> float:
         """
         J/m along-ground at given airspeed. Uses drag polar and prop efficiency.
         Assumes coordinated level flight (phi=0). For turns, scale induced term by n^2.
+        
+        Args:
+            V_air: Airspeed in m/s
+            wind_xy: Wind vector [vx, vy] in m/s
+            u_hat: Unit vector in leg direction [dx, dy]. If None, uses current velocity direction.
         """
         rho = self.cfg.air_density
         S   = self.cfg.wing_area
@@ -470,7 +511,14 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         D_par = q * S * CD0
         D_ind = k * W**2 / (q * S)  # level flight
         P = (D_par + D_ind) * V_air / max(eta, 1e-3)
-        V_gnd = max(1.0, V_air + np.dot(wind_xy, (self.vel[:2] / (np.linalg.norm(self.vel[:2])+1e-6))))
+        
+        if u_hat is None:
+            # fall back to current track
+            track = self.vel[:2]; track = track/(np.linalg.norm(track)+1e-6)
+        else:
+            track = u_hat/(np.linalg.norm(u_hat)+1e-6)
+        
+        V_gnd = max(1.0, V_air + float(np.dot(wind_xy, track)))
         return P / V_gnd
 
     def calculate_investigation_cost(self, event: GroundEvent) -> float:
@@ -482,7 +530,9 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         d_xy = np.linalg.norm(p0[:2] - pe[:2])
 
         V_cruise = self.cfg.V_range_opt
-        spec_e = self._specific_energy_per_meter(V_cruise, self.wind_xy)
+        # Calculate leg direction vector from current position to event
+        leg_vector = pe[:2] - p0[:2]
+        spec_e = self._specific_energy_per_meter(V_cruise, self.wind_xy, leg_vector)
         E_transit = spec_e * d_xy
 
         phi = self.cfg.loiter_bank_deg * np.pi/180.0
@@ -549,7 +599,7 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
             # motor-off savings while dwelling (assume throttle=0 except trim)
             P_base = self._loiter_power_in_still_air()  # same phi/V as above
             E_saved = P_base * dwell * self.cfg.motor_cut_fraction
-            E_gain  = E_saved
+            E_gain  = 0.0   # no altitude gain in STRICT_ALT
         else:
             # climb within band
             hmax = min(self.alt_band[1], top_height)
@@ -560,7 +610,9 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
 
         # detour is incremental path-length vs planned next waypoint
         d_detour = self._incremental_detour_length(center[:2])
-        E_detour = self._specific_energy_per_meter(self.cfg.V_range_opt, self.wind_xy) * d_detour
+        # Calculate leg direction vector from current position to thermal center
+        leg_vector = center[:2] - p[:2]
+        E_detour = self._specific_energy_per_meter(self.cfg.V_range_opt, self.wind_xy, leg_vector) * d_detour
 
         C = self._thermal_confidence(thermal_or_msg)  # [0,1] from tracker/variometer SNR
         return C * (E_gain + E_saved) - E_detour
@@ -726,12 +778,15 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
             alt_err = self.target_alt - self.pos[2]
             self.vz = np.clip(0.2 * alt_err, self.cfg.descent_rate, self.cfg.climb_rate)
 
-    def _simple_thermal_step(self, sim_time, world):
+    def _simple_thermal_step(self, sim_time, world=None):
         decision = "patrol"
         self.target_alt = self.cfg.altitude_ref_m
 
-        # candidate thermals within detour range
-        thermals = world.get_nearby_thermals(self.pos, self.cfg.thermal_detour_max_km * 1000)
+        # Use world if provided, otherwise whatever thermals the agent already sees
+        if world is not None:
+            thermals = world.get_nearby_thermals(self.pos, self.cfg.thermal_detour_max_km * 1000)
+        else:
+            thermals = self.current_thermals or []
         best, best_score = None, -1e18
 
         for th in thermals:
@@ -764,33 +819,65 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         # Process incoming messages
         messages = self.comm.get_messages(self.uav_id, t)
         self._process_messages(messages, t)
-        
-        # EAGLE Main Loop (Algorithm 1)
-        
-        # Check 0: Absolute safety
+
+        # === Check 0: Absolute safety ===
         if self.battery_pct() < 10.0:  # CRITICAL_THRESHOLD
             if self.flight_mode != "landing":
-                self.eagle_logger.warning(f"CRITICAL battery - initiating emergency landing")
+                self.eagle_logger.warning("CRITICAL battery - initiating emergency landing")
                 self.land()
-            
-        # Check 1: High-priority event investigation
-        elif self._check_for_high_priority_events(events, t):
-            pass  # Handled in method
-            
-        # Check 2: Handle handover requests
-        elif self._handle_handover_requests(t):
-            pass  # Handled in method
-            
-        # Check 3: Cooperative thermal decision (always-on)
-        elif self._cooperative_thermal_step(thermals, t):
-            pass  # either bid, claimed, or enroute to thermal
-            
-        # Check 4: Default behaviors
-        else:
-            self._announce_discoveries(thermals, events, t)
-        
-        # Process ongoing auctions
+            return
+
+        # === Check 0b: Last resort investigation mode ===
+        if self.event_mode == "last_resort":
+            self._continue_last_resort_mission()
+            return
+
+        # === Check 1: High-priority event ===
+        if self._check_for_high_priority_events(events, t):
+            return
+
+        # === Check 1b: Handle handover requests ===
+        if self._handle_handover_requests(t):
+            return
+
+        # === Check 2: Energy management ===
+        if self.battery_pct() < 30.0:  # LOW_THRESHOLD
+            self._handle_proactive_soaring(thermals, t)
+            return
+
+        # OPTIONAL cooperative thermal bidding even when battery is fine
+        # (harmless if no beneficial thermal is around)
+        self._cooperative_thermal_step(thermals, t)
+
+        # === Check 3: Default behaviors ===
+        self._announce_discoveries(thermals, events, t)
+
+        # --- add at the very end of _eagle_step(...) ---
+        # Resolve event & thermal auctions (tier timing, winners, timeouts)
         self._update_auctions(t)
+
+        # After auctions resolve, if we just lost a thermal, immediately try the next-best
+        if getattr(self, "_lost_thermal_recently", False):
+            self._lost_thermal_recently = False
+            # Use whatever thermals we already have for this tick
+            _ = self._handle_live_thermal_opportunities(t)
+
+        # (optional but useful) share state for peers' heuristics
+        self.broadcast_state()
+
+    def _continue_last_resort_mission(self):
+        """Continue navigating to the last-resort target until investigation is complete."""
+        if not hasattr(self, "_last_resort_start"):
+            self._last_resort_start = self.t
+        if self.assigned_event:
+            self._start_event_investigation(self.assigned_event.cx, self.assigned_event.cy)
+            # after finishing, land safely
+            if self._investigation_complete():
+                self.land()
+
+    def _investigation_complete(self) -> bool:
+        # Simple placeholder completion check
+        return (self.t - getattr(self, "_last_resort_start", self.t)) > 60.0
     
     def _process_messages(self, messages: List[Message], current_time: float):
         """Process all incoming messages"""
@@ -948,105 +1035,104 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
     
     def _cooperative_thermal_step(self, thermals: List[Thermal], t: float) -> bool:
         """
-        Always-on cooperative thermal selection:
-        1) Prefer thermals already in auctions (shared).
-        2) If none, consider local world thermals and announce them.
-        3) Bid on the best one if benefit > threshold.
-        Return True if we took any action; else False.
+        Always-on cooperative selection: rank + bid (Algorithm 8 core),
+        leaving sector/border checks for later (geometry-dependent).
         """
-        best_thermal = None
-        best_benefit = -float('inf')
+        self.current_thermals = thermals or []
+        return self._handle_live_thermal_opportunities(t)
 
-        # 1) auctions first
-        for th_id, auction in self.active_thermal_auctions.items():
-            if th_id in self.my_thermal_bids:
-                continue
-            th = auction.thermal
+    def _handle_proactive_soaring(self, thermals: List[Thermal], t: float):
+        """
+        Algorithm 7: when low on battery, proactively seek thermals.
+        Uses the same ranked-iterative selection (Alg. 8 core).
+        """
+        self.current_thermals = thermals or []
+        took_action = self._handle_live_thermal_opportunities(t)
+
+        # Optional: if nothing is worth bidding on, keep existing simple fallback
+        if not took_action:
+            # Minimal "keep moving toward best" behavior without bidding
+            _ = self._simple_thermal_step(t)  # no world parameter needed
+    
+    def _rank_live_thermal_opportunities(self, t: float):
+        """
+        Rank both auctions and world thermals by net benefit.
+        Returns list of tuples: (thermal_obj, benefit_J, source) where source in {"auction","world"}.
+        """
+        ranked = []
+        seen = set()
+
+        # Active auctions we know about
+        for th_id, A in self.active_thermal_auctions.items():
+            th = A.thermal
             if hasattr(th, "active") and not th.active(t):
                 continue
-            benefit = self.calculate_thermal_benefit(th)
-            if benefit > best_benefit and benefit > self.benefit_threshold:
-                best_thermal, best_benefit = th, benefit
+            b = float(self.calculate_thermal_benefit(th))
+            ranked.append((th, b, "auction"))
+            seen.add(th_id)
 
-        # 2) then local world thermals
-        if best_thermal is None:
-            for th in thermals:
-                if not th.active(t):
-                    continue
-                benefit = self.calculate_thermal_benefit(th)
-                if benefit > best_benefit and benefit > self.benefit_threshold:
-                    best_thermal, best_benefit = th, benefit
+        # World thermals not yet announced
+        for th in (self.current_thermals or []):
+            if hasattr(th, "active") and not th.active(t):
+                continue
+            th_key = self._thermal_key(th.center, th.top_height, th.radius)
+            if th_key in seen:
+                continue
+            b = float(self.calculate_thermal_benefit(th))
+            ranked.append((th, b, "world"))
 
-        if best_thermal is None:
-            return False
+        ranked.sort(key=lambda r: r[1], reverse=True)
+        return ranked
 
-        # If it's a world thermal and not announced yet, announce + open auction
-        if hasattr(best_thermal, 'id_int'):
-            th_key = self._thermal_key(best_thermal.center, best_thermal.top_height, best_thermal.radius)
-            if th_key not in self.active_thermal_auctions:
+    def _handle_live_thermal_opportunities(self, t: float) -> bool:
+        """
+        Implements the iterative selection loop of Algorithm 8:
+          - rank opportunities
+          - announce world thermals (if needed)
+          - bid on the best above threshold that we haven't already bid on
+        NOTE: sector/border gating intentionally omitted (depends on ops geometry).
+        Returns True if we bid or started exploitation.
+        """
+        candidates = self._rank_live_thermal_opportunities(t)
+
+        for th, benefit, src in candidates:
+            if benefit <= self.benefit_threshold:
+                break  # all remaining will be worse
+
+            th_key = self._thermal_key(th.center, th.top_height, th.radius)
+            if th_key in self.my_thermal_bids:
+                continue  # already competing for this one
+
+            # If it's a world thermal, announce it once so others can compete fairly
+            if src == "world" and th_key not in self.active_thermal_auctions:
                 self.comm.broadcast(
                     self.uav_id,
                     MessageType.THERMAL_DISCOVERED,
                     {
                         "thermal_id": th_key,
-                        "position": list(best_thermal.center),
-                        "strength": best_thermal.strength,
-                        "radius": best_thermal.radius,
-                        "base_height": getattr(best_thermal, "base_height", 0.0),
-                        "top_height": best_thermal.top_height,
-                        "spawn_time": getattr(best_thermal, "spawn_time", self.tnow),
-                        "end_time":   getattr(best_thermal, "end_time",   self.tnow + 300.0),
-                        "benefit_score": float(best_benefit)
+                        "position": list(th.center),
+                        "strength": th.strength,
+                        "radius": th.radius,
+                        "base_height": getattr(th, "base_height", 0.0),
+                        "top_height": th.top_height,
+                        "spawn_time": getattr(th, "spawn_time", self.tnow),
+                        "end_time":   getattr(th, "end_time",   self.tnow + 300.0),
+                        "benefit_score": float(benefit),
                     }
                 )
                 self.active_thermal_auctions[th_key] = ThermalAuction(
                     thermal_id=th_key,
-                    thermal=best_thermal,
+                    thermal=th,
                     initiator_id=self.uav_id,
                     start_time=self.tnow,
                     bids=[]
                 )
 
-        # Bid (cooperative selection)
-        self._compete_for_thermal(best_thermal, best_benefit)
-        return True
+            # Bid on it (Alg. 10)
+            self._compete_for_thermal(th, benefit)
+            return True
 
-    def _handle_proactive_soaring(self, thermals: List[Thermal], t: float):
-        """
-        Seek thermals when battery is low (Algorithm 7)
-        """
-        # Check live thermal broadcasts first
-        best_thermal = None
-        best_benefit = -float('inf')
-        
-        for thermal_id, auction in self.active_thermal_auctions.items():
-            if thermal_id in self.my_thermal_bids:
-                continue
-                
-            benefit = self.calculate_thermal_benefit(auction.thermal)
-            if benefit > best_benefit and benefit > self.benefit_threshold:
-                best_thermal = auction.thermal
-                best_benefit = benefit
-        
-        # If no good broadcast thermal, search known thermals
-        if not best_thermal:
-            for thermal in thermals:
-                if not thermal.active(t):
-                    continue
-                    
-                benefit = self.calculate_thermal_benefit(thermal)
-                if benefit > best_benefit and benefit > self.benefit_threshold:
-                    best_thermal = thermal
-                    best_benefit = benefit
-        
-        # Initiate exploitation if found
-        if best_thermal:
-            self.eagle_logger.info(f"Pursuing thermal with benefit={best_benefit:.0f}J")
-            if hasattr(best_thermal, 'id'):
-                self._compete_for_thermal(best_thermal, best_benefit)
-            else:
-                # Direct exploitation of discovered thermal
-                self._initiate_thermal_exploitation(best_thermal, t)
+        return False
     
     def _announce_discoveries(self, thermals: List[Thermal], events: List[GroundEvent], t: float):
         """Announce newly discovered thermals and events"""
@@ -1118,7 +1204,21 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
                 A.current_tier = tier_idx
             # hard timeout → last resort for initiator
             if not A.resolved and elapsed >= self.auction_timeout and A.initiator_id == self.uav_id:
-                self._claim_and_investigate(A.event)
+                # Last-resort path per Algorithm 6
+                self.assigned_event = A.event
+                self.event_mode = "last_resort"
+                self._last_resort_start = t
+
+                # Notify peers
+                self.comm.broadcast(
+                    self.uav_id,
+                    MessageType.INVESTIGATING_LAST_RESORT,
+                    {"event_id": A.event.id, "position": [A.event.cx, A.event.cy]}
+                )
+
+                # Immediately start investigation (loiter logic will run in the mode handler)
+                self._start_event_investigation(A.event.cx, A.event.cy)
+
                 A.resolved = True
             if A.resolved:
                 del self.active_event_auctions[event_id]
@@ -1129,7 +1229,7 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
             if T.resolved:
                 continue
             elapsed = t - T.start_time
-            if elapsed >= self.tier_timeout:  # simple one-shot settle
+            if elapsed >= self.tier_timeout:
                 if T.bids:
                     winner_id, best = max(T.bids, key=lambda x: (x[1], x[0]))
                     T.winner_id, T.resolved = winner_id, True
@@ -1137,9 +1237,12 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
                                         {"thermal_id": th_id, "winner_id": winner_id})
                     if winner_id == self.uav_id:
                         self._initiate_thermal_exploitation(T.thermal, t)
+                    else:
+                        # mark retry opportunity after loss
+                        self._lost_thermal_recently = True
                 else:
-                    # no interest; let it expire
                     T.resolved = True
+
             if T.resolved:
                 del self.active_thermal_auctions[th_id]
                 self.my_thermal_bids.discard(th_id)
@@ -1215,7 +1318,10 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
     
     def _handle_thermal_discovered_msg(self, msg: Message):
         """Handle thermal discovery announcement"""
-        th_key = self._thermal_key(msg.data["position"], msg.data["top_height"], msg.data["radius"])
+        # prefer the sender's key if present to avoid rounding mismatches
+        th_key = msg.data.get("thermal_id") or self._thermal_key(
+            msg.data["position"], msg.data["top_height"], msg.data["radius"]
+        )
         if th_key in self.active_thermal_auctions:
             return
         
@@ -1234,9 +1340,10 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         if "base_height" in msg.data:
             thermal.base_height = msg.data["base_height"]
         if "spawn_time" in msg.data:
-            thermal.spawn_time = msg.data["spawn_time"]
+            thermal.spawn_time = float(msg.data["spawn_time"])
         if "end_time" in msg.data:
-            thermal.end_time = msg.data["end_time"]
+            # set lifetime instead of end_time
+            thermal.lifetime = max(1.0, float(msg.data["end_time"]) - thermal.spawn_time)
         
         auction = ThermalAuction(
             thermal_id=th_key,
@@ -1256,7 +1363,12 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
             agent_id = msg.data["agent_id"]
             benefit = msg.data["benefit_score"]
             
-            auction.bids.append((agent_id, benefit))
+            # Deduplicate bids per agent - keep the max benefit
+            bids = {a: b for a, b in auction.bids}
+            prev = bids.get(agent_id, -1e18)
+            if benefit > prev:
+                bids[agent_id] = benefit
+                auction.bids = list(bids.items())
     
     def _handle_thermal_claimed_msg(self, msg: Message):
         """Handle thermal claimed message"""
@@ -1380,13 +1492,13 @@ class CollisionAvoidance:
         if np.linalg.norm(v_cmd) > V_max:
             v_cmd = v_cmd / np.linalg.norm(v_cmd) * V_max
         # map to achievable course-rate
-        psi_goal = math.atan2(v_cmd[1], v_cmd[0])
+        psi_goal = math.atan2(v_cmd[0], v_cmd[1])  # x,y → atan2(x, y) like the agent
         psi_err  = np.arctan2(np.sin(psi_goal - current_heading), np.cos(psi_goal - current_heading))
         psi_dot  = np.clip(k_psi * psi_err, -psi_dot_max, psi_dot_max)
         # Return desired *velocity* consistent with limited heading rate
         V = np.clip(np.linalg.norm(v_cmd), V_min, V_max)
         psi_next = current_heading + psi_dot * dt
-        return np.array([V * np.cos(psi_next), V * np.sin(psi_next), v_cmd[2]])
+        return np.array([V * math.sin(psi_next), V * math.cos(psi_next), v_cmd[2]])
     
     def _repulsive_velocity(self,
                            p_i: np.ndarray,
