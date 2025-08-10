@@ -101,10 +101,10 @@ class PhoenixConfig:
     thermal_conf_min: float = 0.6  # min confidence to engage
     
     # Probability map configuration
-    probmap_meta_path: str = "/path/to/probability_map_metadata.json"
-    probmap_prob_path: str = "/path/to/conditional_probability_map.npy"
-    probmap_avg_npz_path: str = "/path/to/average_thermal_metrics.npz"
-    probmap_lc_raster_path: str = "/path/to/landcover-2020-classification.tif"
+    probmap_meta_path: str = "/home/px4_sitl/ets_work/montreal_research/thermal_synthetic_data_generation/notebook/phase1/probability_map_metadata.json"
+    probmap_prob_path: str = "/home/px4_sitl/ets_work/montreal_research/thermal_synthetic_data_generation/notebook/phase1/conditional_probability_map.npy"
+    probmap_avg_npz_path: str = "/home/px4_sitl/ets_work/montreal_research/thermal_synthetic_data_generation/notebook/phase1/average_thermal_metrics.npz"
+    probmap_lc_raster_path: str = "/home/px4_sitl/ets_work/montreal_research/thermal_synthetic_data_generation/montreal_government_data/landcover-2020-classification.tif"
 
     # Runtime knobs
     probmap_aoi_half_width_m: float = 500.0

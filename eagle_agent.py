@@ -154,6 +154,22 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         
         # Logging
         self.eagle_logger = self._setup_eagle_logger()
+
+        # --- Probabilistic map integration (lazy-loaded) ---
+        self._probmap_loaded = False
+        self._probmap_meta = None
+        self._probmap = None
+        self._avg_metrics = None
+        self._lc_ds = None
+        self._grid_affine = None
+        self._grid_crs = None
+        self._season_map = None
+        self._tod_map = None
+        self._lc_code_to_idx = None
+        self._to_grid_transform = None  # function: (x,y) in UTM -> (x,y) in grid CRS
+        self._regions_catalog = None    # list of Region objects (UTM CRS)
+        self._home_region_poly = None   # shapely polygon in UTM CRS
+        self._neighbor_regions = None   # list of (name, poly) neighbors in UTM CRS
     
     @property
     def vel(self) -> np.ndarray:
@@ -847,7 +863,14 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
 
         # OPTIONAL cooperative thermal bidding even when battery is fine
         # (harmless if no beneficial thermal is around)
-        self._cooperative_thermal_step(thermals, t)
+        took_action = self._cooperative_thermal_step(thermals, t)
+
+        # === Fallback: Search probabilistic map when no live opportunities ===
+        if not took_action:
+            try:
+                took_action = self._search_probabilistic_map(t)
+            except Exception as e:
+                self.eagle_logger.warning(f"Probabilistic map search failed: {e}")
 
         # === Check 3: Default behaviors ===
         self._announce_discoveries(thermals, events, t)
@@ -865,173 +888,281 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         # (optional but useful) share state for peers' heuristics
         self.broadcast_state()
 
-    def _continue_last_resort_mission(self):
-        """Continue navigating to the last-resort target until investigation is complete."""
-        if not hasattr(self, "_last_resort_start"):
-            self._last_resort_start = self.t
-        if self.assigned_event:
-            self._start_event_investigation(self.assigned_event.cx, self.assigned_event.cy)
-            # after finishing, land safely
-            if self._investigation_complete():
-                self.land()
+    # ================= Probabilistic Map Integration ==================
+    def _ensure_probmap_loaded(self) -> bool:
+        """Lazy-load probability map, metadata, avg metrics, and land cover raster.
+        Returns True if loaded and ready; False otherwise."""
+        if self._probmap_loaded:
+            return True
+        import os, json
+        try:
+            meta_path = getattr(self.cfg, 'probmap_meta_path', None)
+            prob_path = getattr(self.cfg, 'probmap_prob_path', None)
+            avg_npz_path = getattr(self.cfg, 'probmap_avg_npz_path', None)
+            lc_raster_path = getattr(self.cfg, 'probmap_lc_raster_path', None)
 
-    def _investigation_complete(self) -> bool:
-        # Simple placeholder completion check
-        return (self.t - getattr(self, "_last_resort_start", self.t)) > 60.0
-    
-    def _process_messages(self, messages: List[Message], current_time: float):
-        """Process all incoming messages"""
-        for msg in messages:
-            self.eagle_logger.info(f"Received {msg.msg_type.value} from {msg.sender_id}")
-            
-            if msg.msg_type == MessageType.HANDOVER_REQUEST:
-                self._handle_handover_request_msg(msg, current_time)
-                
-            elif msg.msg_type == MessageType.EVENT_BID:
-                self._handle_event_bid_msg(msg)
-                
-            elif msg.msg_type == MessageType.TASK_CLAIMED:
-                self._handle_task_claimed_msg(msg)
-                
-            elif msg.msg_type == MessageType.THERMAL_DISCOVERED:
-                self._handle_thermal_discovered_msg(msg)
-                
-            elif msg.msg_type == MessageType.LIVE_THERMAL_BID:
-                self._handle_thermal_bid_msg(msg)
-                
-            elif msg.msg_type == MessageType.THERMAL_CLAIMED:
-                self._handle_thermal_claimed_msg(msg)
-                
-            elif msg.msg_type == MessageType.AGENT_STATE:
-                self._update_peer_state(msg)
-    
-    def _check_for_high_priority_events(self, events: List[GroundEvent], t: float) -> bool:
-        """
-        Check for high-priority events and initiate investigation
-        Returns True if handling an event
-        """
-        # Skip if already investigating
-        if self.event_mode == "investigating":
-            return True
-            
-        # Look for new high-priority events
-        for event in events:
-            if event.level != "High" or not event.active(t):
-                continue
-                
-            # Check if already detected
-            if event.id in self.detected_event_ids:
-                continue
-                
-            # Check detection range
-            dist = np.linalg.norm(self.pos[:2] - np.array([event.cx, event.cy]))
-            if dist > 1000.0:  # Max detection range
-                continue
-            
-            self.eagle_logger.info(f"Detected high-priority event {event.id}")
-            self.detected_event_ids.add(event.id)
-            
-            # Calculate investigation cost
-            cost = self.calculate_investigation_cost(event)
-            
-            # Check feasibility
-            energy_available = self.energy_wh * 3600  # Convert to Joules
-            if energy_available - cost > 0.2 * self.cfg.batt_capacity_wh * 3600:  # Keep 20% reserve
-                # Can handle it ourselves
-                self.eagle_logger.info(f"Claiming event {event.id} (cost={cost:.0f}J)")
-                self._claim_and_investigate(event)
-                return True
+            if not (meta_path and prob_path and lc_raster_path):
+                return False
+            if not (os.path.isfile(meta_path) and os.path.isfile(prob_path) and os.path.isfile(lc_raster_path)):
+                return False
+
+            # Load metadata
+            with open(meta_path, 'r') as f:
+                self._probmap_meta = json.load(f)
+
+            # Load probability map
+            import numpy as _np
+            self._probmap = _np.load(prob_path)
+
+            # Optional average metrics
+            if avg_npz_path and os.path.isfile(avg_npz_path):
+                self._avg_metrics = _np.load(avg_npz_path)
+
+            # Land cover raster and grid
+            import rasterio as _rio
+            self._lc_ds = _rio.open(lc_raster_path)
+            from rasterio import Affine as _Affine
+            self._grid_affine = _Affine.from_gdal(*self._probmap_meta['grid_affine_transform_gdal'])
+            self._grid_crs = str(self._probmap_meta['grid_crs'])
+
+            # Context mappings
+            self._season_map = self._probmap_meta['context_mappings']['season']
+            self._tod_map = self._probmap_meta['context_mappings']['time_of_day']
+            # Ensure LC code keys are int
+            lc_map = self._probmap_meta['context_mappings']['land_cover_code_to_index']
+            self._lc_code_to_idx = {int(k): v for k, v in (lc_map.items() if isinstance(lc_map, dict) else lc_map)}
+
+            # Build transform from UTM (simulation coords) to grid CRS if needed
+            from config import UTM_CRS
+            if str(UTM_CRS) != str(self._grid_crs):
+                import pyproj
+                transformer = pyproj.Transformer.from_crs(UTM_CRS, self._grid_crs, always_xy=True)
+                self._to_grid_transform = transformer.transform
             else:
-                # Need help - broadcast handover request
-                self.eagle_logger.info(f"Broadcasting handover request for event {event.id}")
-                self._broadcast_handover_request(event, t)
-                return True
-        
-        return False
-    
-    def _broadcast_handover_request(self, event: GroundEvent, t: float):
-        """Broadcast event handover request (Algorithm 2)"""
-        # Create auction
-        auction = EventAuction(
-            event_id=event.id,
-            event=event,
-            initiator_id=self.uav_id,
-            start_time=t,
-            tier_bids={tier.value: [] for tier in AgentTier}
-        )
-        self.active_event_auctions[event.id] = auction
-        
-        # Broadcast request
-        self.comm.broadcast(
-            self.uav_id,
-            MessageType.HANDOVER_REQUEST,
-            {
-                "event_id": event.id,
-                "event_level": event.level,
-                "position": [event.cx, event.cy],
-                "detection_time": t
-            }
-        )
-    
-    def _handle_handover_requests(self, t: float) -> bool:
-        """
-        Handle received handover requests (Algorithm 3)
-        Returns True if participating in an auction
-        """
-        # Check if we're eligible to help (healthy state)
-        if self.battery_pct() < 30.0 or self.event_mode == "investigating":
-            return False
-        
-        # Find earliest pending auction we haven't bid on
-        earliest_auction = None
-        earliest_time = float('inf')
-        
-        for auction in self.active_event_auctions.values():
-            if (auction.event_id not in self.my_event_bids and 
-                auction.initiator_id != self.uav_id and
-                auction.start_time < earliest_time):
-                earliest_auction = auction
-                earliest_time = auction.start_time
-        
-        if earliest_auction:
-            self._attempt_event_bid(earliest_auction, t)
+                self._to_grid_transform = None
+
+            # Load regions to support patrol sector filtering (UTM CRS)
+            try:
+                from events import load_region_catalog
+                from config import GEOJSON_PATH, UTM_CRS as _UTM
+                self._regions_catalog = load_region_catalog(GEOJSON_PATH, _UTM)
+                # cache home region polygon if set
+                if self.home_region:
+                    target_key = self.home_region.lower()
+                    for r in self._regions_catalog:
+                        if r.key == target_key:
+                            self._home_region_poly = r.geom
+                            break
+            except Exception:
+                self._regions_catalog = None
+
+            self._probmap_loaded = True
+            self.eagle_logger.info("Probabilistic map resources loaded")
             return True
-        
-        return False
-    
-    def _attempt_event_bid(self, auction: EventAuction, t: float):
-        """Submit bid for event investigation (Algorithm 4)"""
-        # Check if within bidding pool (2km radius)
-        dist = np.linalg.norm(
-            self.pos[:2] - np.array([auction.event.cx, auction.event.cy])
-        )
-        if dist > 2000.0:
-            return
-        
-        # Calculate our cost
-        cost = self.calculate_investigation_cost(auction.event)
-        
-        # Check feasibility with reserve
-        energy_available = self.energy_wh * 3600
-        if energy_available - cost < 0.2 * self.cfg.batt_capacity_wh * 3600:
-            return
-        
-        # Submit bid based on our tier
-        tier = self.get_tier()
-        
-        self.comm.broadcast(
-            self.uav_id,
-            MessageType.EVENT_BID,
-            {
-                "event_id": auction.event_id,
-                "bid_cost": cost,
-                "tier": tier.value,
-                "agent_id": self.uav_id
-            }
-        )
-        
-        self.my_event_bids.add(auction.event_id)
-        self.eagle_logger.info(f"Submitted bid for event {auction.event_id}: cost={cost:.0f}J, tier={tier.value}")
+        except Exception as e:
+            self.eagle_logger.warning(f"Failed to load probability map resources: {e}")
+            return False
+
+    def _context_indices_from_time(self, timestamp: float) -> Tuple[Optional[int], Optional[int]]:
+        """Derive season and time-of-day indices from current sim time (seconds)."""
+        # Map sim-time seconds to a nominal date/time cycle; we approximate using a fixed calendar
+        # Assume t=0 corresponds to June 1st 12:00 for categorization stability
+        import datetime as _dt
+        base = _dt.datetime(2025, 6, 1, 12, 0, 0)
+        current = base + _dt.timedelta(seconds=float(timestamp))
+        # Build reverse maps
+        season_name = None
+        if current.month in [6, 7, 8]:
+            season_name = "Summer"
+        elif current.month in [5, 9]:
+            season_name = "Spring/Fall"
+        tod_name = None
+        if 10 <= current.hour < 12:
+            tod_name = "Morning"
+        elif 12 <= current.hour < 16:
+            tod_name = "Afternoon"
+        elif 16 <= current.hour < 18:
+            tod_name = "Late Afternoon"
+        s_idx = self._season_map.get(season_name) if (self._season_map and season_name) else None
+        t_idx = self._tod_map.get(tod_name) if (self._tod_map and tod_name) else None
+        return s_idx, t_idx
+
+    def _is_inside_patrol_or_border(self, x_utm: float, y_utm: float, thermal_xy_utm: Tuple[float, float]) -> bool:
+        """Filter candidates to those in home sector; allow adjacent sectors if near border."""
+        if not self._regions_catalog or not self._home_region_poly:
+            # No region data; allow all
+            return True
+        try:
+            from shapely.geometry import Point as _Point
+            p_uav = _Point(x_utm, y_utm)
+            p_th = _Point(thermal_xy_utm[0], thermal_xy_utm[1])
+            if self._home_region_poly.contains(p_th):
+                return True
+            # Border zone: within 200 m of boundary
+            border_buf_m = 200.0
+            if self._home_region_poly.boundary.buffer(border_buf_m).contains(p_uav):
+                # Check adjacency: if thermal lies in any touching region
+                for r in self._regions_catalog:
+                    if r.geom is self._home_region_poly:
+                        continue
+                    if r.geom.touches(self._home_region_poly) and r.geom.contains(p_th):
+                        return True
+            return False
+        except Exception:
+            return True
+
+    def _search_probabilistic_map(self, t: float) -> bool:
+        """Implements SearchProbabilisticMap: query precomputed P-map, filter by sector, pick best, and initiate soaring.
+        Returns True if an action was taken (navigation/bid/exploitation), False otherwise."""
+        if not self._ensure_probmap_loaded():
+            return False
+
+        # Determine context
+        season_idx, tod_idx = self._context_indices_from_time(t)
+        if season_idx is None or tod_idx is None:
+            return False
+
+        import numpy as _np
+        import rasterio as _rio
+        from rasterio.transform import rowcol as _rowcol
+
+        # Define AOI in grid coordinates
+        aoi_half = float(getattr(self.cfg, 'probmap_aoi_half_width_m', 500.0))
+        # Convert agent UTM position into grid CRS if necessary
+        x, y = float(self.pos[0]), float(self.pos[1])
+        if self._to_grid_transform:
+            gx, gy = self._to_grid_transform(x, y)
+        else:
+            gx, gy = x, y
+
+        # AOI bounds in meters (grid CRS)
+        min_x = gx - aoi_half; max_x = gx + aoi_half
+        min_y = gy - aoi_half; max_y = gy + aoi_half
+
+        # Grid index bounds
+        try:
+            r_min, c_min = _rio.transform.rowcol(self._grid_affine, min_x, max_y)
+            r_max, c_max = _rio.transform.rowcol(self._grid_affine, max_x, min_y)
+        except Exception:
+            return False
+
+        # Clamp
+        grid_h = int(self._probmap_meta['grid_dimensions']['height'])
+        grid_w = int(self._probmap_meta['grid_dimensions']['width'])
+        r_min = max(0, r_min); c_min = max(0, c_min)
+        r_max = min(grid_h - 1, r_max); c_max = min(grid_w - 1, c_max)
+        if r_min > r_max or c_min > c_max:
+            return False
+
+        threshold = float(getattr(self.cfg, 'probmap_probability_threshold', 0.5))
+
+        candidates: List[Tuple[Tuple[int,int], float, Tuple[float,float]]] = []  # ((r,c), prob, (x_m,y_m) in grid CRS)
+        for r in range(r_min, r_max + 1):
+            for c in range(c_min, c_max + 1):
+                # Cell center
+                cx_m, cy_m = self._grid_affine * (c + 0.5, r + 0.5)
+                # Land cover at center
+                try:
+                    lc = next(self._lc_ds.sample([(cx_m, cy_m)], indexes=1))[0]
+                    if lc == self._lc_ds.nodata:
+                        lc = 0
+                except Exception:
+                    lc = 0
+                lc_idx = self._lc_code_to_idx.get(int(lc))
+                if lc_idx is None:
+                    continue
+                try:
+                    p = float(self._probmap[r, c, season_idx, tod_idx, lc_idx])
+                except Exception:
+                    p = 0.0
+                if p >= threshold:
+                    candidates.append(((r, c), p, (cx_m, cy_m)))
+
+        if not candidates:
+            return False
+
+        # Filter by patrol sector / adjacent sectors
+        # Convert candidate centers from grid CRS back to UTM for region tests
+        to_utm = None
+        if self._to_grid_transform is not None:
+            # we have UTM->grid; build inverse for grid->UTM
+            try:
+                import pyproj
+                from config import UTM_CRS
+                inv_transformer = pyproj.Transformer.from_crs(self._grid_crs, UTM_CRS, always_xy=True)
+                to_utm = inv_transformer.transform
+            except Exception:
+                to_utm = None
+        filtered: List[Tuple[Tuple[int,int], float, Tuple[float,float], Tuple[float,float]]] = []
+        for (r, c), prob, (cx_m, cy_m) in candidates:
+            if to_utm:
+                ux, uy = to_utm(cx_m, cy_m)
+            else:
+                ux, uy = cx_m, cy_m
+            if self._is_inside_patrol_or_border(self.pos[0], self.pos[1], (ux, uy)):
+                filtered.append(((r, c), prob, (cx_m, cy_m), (ux, uy)))
+
+        if not filtered:
+            return False
+
+        # Rank by net benefit using a lightweight Thermal proxy with average metrics if available
+        best = None
+        best_score = -1e18
+        for (_idx, prob, (_gx, _gy), (ux, uy)) in filtered:
+            # Build a Thermal object using avg metrics if available; else default Medium
+            th = Thermal(center=(ux, uy), condition='Medium', t0=t)
+            # Override with averages if provided
+            try:
+                if self._avg_metrics is not None:
+                    season_i, tod_i = season_idx, tod_idx
+                    # landcover index for the chosen cell (recompute for UTM coords)
+                    lc_code = 0
+                    try:
+                        lx, ly = (_gx, _gy)
+                        lc_code = int(next(self._lc_ds.sample([(lx, ly)], indexes=1))[0])
+                        if lc_code == self._lc_ds.nodata:
+                            lc_code = 0
+                    except Exception:
+                        lc_code = 0
+                    lc_i = self._lc_code_to_idx.get(int(lc_code))
+                    if lc_i is not None:
+                        idx = (int(_idx[0]), int(_idx[1]), season_i, tod_i, lc_i)
+                        # Use safe fetch with fallback
+                        def _safe(arr, i):
+                            try:
+                                v = float(arr[i])
+                                return v
+                            except Exception:
+                                return None
+                        avg_lift = _safe(self._avg_metrics['avg_lift'], idx)
+                        avg_radius = _safe(self._avg_metrics['avg_radius'], idx)
+                        avg_height = _safe(self._avg_metrics['avg_height'], idx)
+                        if avg_radius is not None and avg_radius > 1.0:
+                            th.radius = avg_radius
+                        if avg_lift is not None and avg_lift > 0.0:
+                            th.strength = avg_lift
+                        if avg_height is not None and avg_height > th.base_height:
+                            th.top_height = avg_height
+            except Exception:
+                pass
+
+            benefit_J = float(self.calculate_thermal_benefit(th))
+            # Encourage higher map probability modestly
+            score = benefit_J + 0.1 * prob * self.cfg.batt_capacity_wh * 3600.0
+            if score > best_score and benefit_J > self.benefit_threshold:
+                best = th
+                best_score = score
+
+        if best is None:
+            return False
+
+        # Feasibility check: reuse calculate_thermal_benefit threshold already applied
+        # Execute soaring attempt: navigate toward center and start exploitation on arrival
+        self._goto(best.center[0], best.center[1])
+        self.target_speed = max(self.cfg.min_speed, self.cfg.V_cmd_min)
+        # Start exploitation immediately; motor will cut when inside per _update_power
+        self._initiate_thermal_exploitation(best, t)
+        return True
     
     def _cooperative_thermal_step(self, thermals: List[Thermal], t: float) -> bool:
         """
