@@ -2,6 +2,9 @@
 
 **Enhanced Agent-based Guidance for Low-energy Exploitation**
 
+> **🚀 NEW: Master2 Branch Available!**  
+> This branch includes the **Probabilistic Thermal Map Integration** (`probmap` package) that enhances thermal exploitation capabilities using pre-computed probability maps. See [Probabilistic Map Features](#probabilistic-map-features) below.
+
 A sophisticated multi-UAV cooperative decision-making system that implements advanced energy management, thermal soaring, and event investigation capabilities.
 
 ## 🚁 Overview
@@ -27,6 +30,12 @@ This project implements the EAGLE (Enhanced Agent-based Guidance for Low-energy 
 - **Deterministic Communication**: Simulation-time-based message handling
 - **Modular Architecture**: Standalone agents with complete flight capabilities
 
+### 🗺️ **Probabilistic Map Features**
+- **Offline Map Generation**: Pre-computed conditional probability maps for thermal events
+- **Context-Aware Queries**: Season, time-of-day, and land cover based thermal probability estimation
+- **Fallback Strategy**: Automatic fallback to probabilistic map when live thermal opportunities are scarce
+- **Geospatial Filtering**: Region-aware thermal search within patrol sectors and adjacent areas
+
 ## 📁 Project Structure
 
 ```
@@ -38,6 +47,10 @@ project_montreal_v2.0/
 ├── world.py              # Simulation world and environment
 ├── thermals.py           # Thermal modeling (external dependency)
 ├── events.py             # Ground event modeling (external dependency)
+├── probmap/              # Probabilistic thermal map package
+│   ├── __init__.py       # Package initialization
+│   ├── offline.py        # Offline map generation and building
+│   └── online.py         # Online probability map querying
 └── README.md             # This file
 ```
 
@@ -83,7 +96,16 @@ class PhoenixConfig:
     alt_band_m: float = 100.0
     V_range_opt: float = 18.0
     V_loiter: float = 15.0
-```
+    
+    # Probability map configuration
+    probmap_meta_path: str = "path/to/probability_map_metadata.json"
+    probmap_prob_path: str = "path/to/conditional_probability_map.npy"
+    probmap_avg_npz_path: str = "path/to/average_thermal_metrics.npz"
+    probmap_lc_raster_path: str = "path/to/landcover_classification.tif"
+    
+    # Runtime knobs
+    probmap_aoi_half_width_m: float = 500.0
+    probmap_probability_threshold: float = 0.5
 
 ## 🎮 Simulation Features
 
@@ -141,4 +163,7 @@ This project is developed for research purposes in autonomous UAV systems.
 
 **Developed by**: EAGLE Research Team  
 **Repository**: https://github.com/mirzaanaswahid/project_montreal_v2.0  
-**Version**: 2.0 
+**Branches**: 
+- `master`: Original EAGLE implementation
+- `master2`: **NEW** - Includes probabilistic thermal map integration  
+**Version**: 2.0 (with probmap enhancement) 
