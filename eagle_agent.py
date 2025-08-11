@@ -83,6 +83,19 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         # Flight modes
         self.flight_mode = "ground"  # ground, armed, takeoff, mission, landing
         self.soaring_state = "normal"  # normal, thermal_exploitation, gliding
+        # exploration state
+        self._explore_center = None
+        self._explore_start = 0.0
+        self._explore_r0 = 30.0
+        self._explore_max_r = 120.0     # ≈ your "~100 m" area
+        self._explore_max_s = 45.0      # cap exploration time (s)
+        self._explore_omega = 0.6       # rad/s spiral angular rate
+        self._explore_rdot = 1.5        # m/s outward growth
+
+        # detection threshold
+        self._w_detect = 0.5            # m/s updraft considered "real"
+        self._w_hits_needed = 2         # consecutive seconds over threshold
+        self._w_hits = 0
         self.event_mode = "idle"  # idle, investigating
         
         # Waypoint navigation
@@ -238,6 +251,7 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
     def set_waypoints(self, wps):
         """Set waypoints for navigation"""
         self.waypoints = [np.asarray(wp, dtype=float) for wp in wps]
+        self.planned_route = self.waypoints[:]    # mirror for detour cost calculation
         self.current_wp_index = 0 if wps else -1
         self.eagle_logger.info(f"{self.uav_id} received {len(self.waypoints)} waypoints")
     
@@ -263,6 +277,7 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         
         # Update simulation time
         self.t = t
+        self.dt = float(dt)
         
         # pull wind (incl. vertical updraft) from the world
         if world is not None:
@@ -302,8 +317,11 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         self._update_power()
         self.energy_wh = max(self.energy_wh - self.P_elec * dt / 3600.0, 0.0)
         
-        # Motor-use accumulator per FEnergy (count motor only when not soaring)
-        motor_on = (self.soaring_state not in ("thermal_exploitation", "gliding"))
+        # Motor-use accumulator per FEnergy (count motor only when not soaring inside thermals)
+        motor_on = not (
+            (self.soaring_state == "thermal_exploitation" and self._inside_thermal)
+            or (self.soaring_state == "gliding")
+        )
         if motor_on:
             self.cmotor_J += float(self.P_elec) * dt  # J = W * s
     
@@ -356,6 +374,8 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
                 self._handle_event_investigation()
             elif self.soaring_state == "thermal_exploitation":
                 self._handle_thermal_exploitation()
+            elif self.soaring_state == "exploring":
+                self._handle_thermal_exploration()
             else:
                 self._update_waypoint_navigation()
         
@@ -1158,12 +1178,16 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         if best is None:
             return False
 
-        # Feasibility check: reuse calculate_thermal_benefit threshold already applied
-        # Execute soaring attempt: navigate toward center and start exploitation on arrival
-        self._goto(best.center[0], best.center[1])
+        # Start exploration at the chosen cell
+        ux, uy = best_center if best_center is not None else (best.center[0], best.center[1])
+        self._explore_center = np.array([ux, uy], dtype=float)
+        self._explore_start = t
+        self._w_hits = 0
+        self.soaring_state = "exploring"
+
+        # Fly there
+        self._goto(ux, uy)
         self.target_speed = max(self.cfg.min_speed, self.cfg.V_cmd_min)
-        # Start exploitation immediately; motor will cut when inside per _update_power
-        self._initiate_thermal_exploitation(best, t)
         return True
     
     def _cooperative_thermal_step(self, thermals: List[Thermal], t: float) -> bool:
@@ -1539,6 +1563,146 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
                 "event_mode": self.event_mode
             }
         )
+
+    def _handle_thermal_exploration(self):
+        # go to the cell first
+        if self._explore_center is None:
+            self.soaring_state = "normal"
+            return
+
+        to_center = self._distance_to([self._explore_center[0], self._explore_center[1], self.pos[2]])
+        if to_center > 20.0:  # arrive tolerance
+            self._goto(self._explore_center[0], self._explore_center[1])
+            self.target_speed = max(self.cfg.min_speed, self.cfg.V_cmd_min)
+            self._fly_towards_target()
+            return
+
+        # inside the cell → spiral search
+        elapsed = self.t - self._explore_start
+        if elapsed > self._explore_max_s:
+            # timeout → give up exploration
+            self.soaring_state = "normal"
+            self._explore_center = None
+            self._goto_patrol_route()
+            return
+
+        # simple outward spiral
+        r = min(self._explore_r0 + self._explore_rdot * elapsed, self._explore_max_r)
+        theta = self._explore_omega * elapsed
+        tgt = np.array([
+            self._explore_center[0] + r * math.cos(theta),
+            self._explore_center[1] + r * math.sin(theta)
+        ])
+        self._goto(tgt[0], tgt[1])
+        self.target_speed = self.cfg.min_speed
+        self._fly_towards_target()
+
+        # sense vertical wind already cached in cfg.wind_enu by update()
+        w_sensed = float(getattr(self.cfg, "wind_enu", np.zeros(3))[2])
+        if w_sensed >= self._w_detect:
+            self._w_hits += 1
+        else:
+            self._w_hits = 0
+
+        # commit if sustained lift detected
+        if self._w_hits >= self._w_hits_needed:
+            # create a lightweight Thermal so existing exploitation logic works;
+            # (world's actual vertical wind remains the source of climb)
+            th = Thermal(center=(self.pos[0], self.pos[1]), condition='Medium', t0=self.t)
+            th.radius = max(60.0, 0.5 * self._explore_max_r)  # a reasonable initial radius
+            # keep default heights; the world's wind is what matters
+            self._initiate_thermal_exploitation(th, self.t)
+            self.soaring_state = "thermal_exploitation"
+            self._explore_center = None
+
+    def _process_messages(self, messages: List[Message], t: float):
+        for msg in messages or []:
+            mt = msg.msg_type
+            if mt == MessageType.HANDOVER_REQUEST:
+                self._handle_handover_request_msg(msg, t)
+            elif mt == MessageType.EVENT_BID:
+                self._handle_event_bid_msg(msg)
+            elif mt == MessageType.TASK_CLAIMED:
+                self._handle_task_claimed_msg(msg)
+            elif mt == MessageType.THERMAL_DISCOVERED:
+                self._handle_thermal_discovered_msg(msg)
+            elif mt == MessageType.LIVE_THERMAL_BID:
+                self._handle_thermal_bid_msg(msg)
+            elif mt == MessageType.THERMAL_CLAIMED:
+                self._handle_thermal_claimed_msg(msg)
+            elif mt == MessageType.AGENT_STATE:
+                self._update_peer_state(msg)
+            # Other message types can be added as needed
+
+    def _check_for_high_priority_events(self, events: List[GroundEvent], t: float) -> bool:
+        # Simple, local detection: nearest High within ~1 km horizontal
+        if not events:
+            return False
+        pos2 = self.pos[:2]
+        candidate: Optional[GroundEvent] = None
+        dmin = 1e12
+        for e in events:
+            if getattr(e, "level", "Medium") != "High":
+                continue
+            d = np.linalg.norm(pos2 - np.array([e.cx, e.cy]))
+            if d < dmin and d <= 1000.0:
+                candidate, dmin = e, d
+        if candidate is None:
+            return False
+
+        cost_J = self.calculate_investigation_cost(candidate)
+        reserve_J = float(getattr(self.cfg, "eagle_event_reserve_j", 0.0))
+        if self._J(self.energy_wh) - cost_J >= reserve_J:
+            self._claim_and_investigate(candidate)
+        else:
+            # Broadcast a handover request
+            self.comm.broadcast(
+                self.uav_id, MessageType.HANDOVER_REQUEST,
+                {
+                    "event_id": candidate.id,
+                    "position": [candidate.cx, candidate.cy],
+                    "event_level": candidate.level,
+                    "detection_time": t,
+                }
+            )
+            # Seed an auction object locally so we can accept bids
+            if candidate.id not in self.active_event_auctions:
+                self.active_event_auctions[candidate.id] = EventAuction(
+                    event_id=candidate.id, event=candidate,
+                    initiator_id=self.uav_id, start_time=t,
+                    tier_bids={tier.value: [] for tier in AgentTier}
+                )
+        return True
+
+    def _handle_handover_requests(self, t: float) -> bool:
+        # If there are active auctions we didn't bid on yet, submit one
+        acted = False
+        for event_id, A in list(self.active_event_auctions.items()):
+            if A.resolved or event_id in self.my_event_bids:
+                continue
+            cost = self.calculate_investigation_cost(A.event)
+            reserve_J = float(getattr(self.cfg, "eagle_event_reserve_j", 0.0))
+            if self._J(self.energy_wh) - cost >= reserve_J:
+                self.comm.broadcast(
+                    self.uav_id, MessageType.EVENT_BID,
+                    {
+                        "event_id": event_id,
+                        "tier": self.get_tier().value,
+                        "bid_cost": float(cost),
+                        "agent_id": self.uav_id
+                    }
+                )
+                self.my_event_bids.add(event_id)
+                acted = True
+        return acted
+
+    def _continue_last_resort_mission(self):
+        # Keep loitering; if battery gets scary, land
+        if self.event_mode != "last_resort":
+            return
+        self._handle_event_investigation()
+        if self.battery_pct() < 15.0 and self.flight_mode != "landing":
+            self.land()
 
 
 # Collision avoidance implementation
