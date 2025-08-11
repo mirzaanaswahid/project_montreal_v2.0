@@ -1108,6 +1108,8 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
         # Rank by net benefit using a lightweight Thermal proxy with average metrics if available
         best = None
         best_score = -1e18
+        best_prob = None
+        best_center = None
         for (_idx, prob, (_gx, _gy), (ux, uy)) in filtered:
             # Build a Thermal object using avg metrics if available; else default Medium
             th = Thermal(center=(ux, uy), condition='Medium', t0=t)
@@ -1147,11 +1149,11 @@ class EAGLEAgent:  # Remove inheritance from UAVAgent
                 pass
 
             benefit_J = float(self.calculate_thermal_benefit(th))
-            # Encourage higher map probability modestly
-            score = benefit_J + 0.1 * prob * self.cfg.batt_capacity_wh * 3600.0
-            if score > best_score and benefit_J > self.benefit_threshold:
+            if benefit_J > best_score and benefit_J > self.benefit_threshold:
                 best = th
-                best_score = score
+                best_score = benefit_J
+                best_prob = prob
+                best_center = (ux, uy)
 
         if best is None:
             return False
